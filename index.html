@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>パッケージ照合アプリ（外部版）</title>
+  <style>
+    body { font-family: sans-serif; padding: 15px; background: #f4f4f9; color: #333; text-align: center; }
+    .card { background: #fff; padding: 15px; border-radius: 8px; margin-bottom: 15px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); text-align: left; }
+    select, button { width: 100%; padding: 12px; margin-top: 5px; margin-bottom: 15px; font-size: 16px; box-sizing: border-box; }
+    button { background: #007bff; color: white; border: none; border-radius: 4px; font-weight: bold; cursor: pointer; }
+    button:active { background: #0056b3; }
+    .result-ok { color: green; font-size: 24px; font-weight: bold; }
+    .result-ng { color: red; font-size: 24px; font-weight: bold; }
+    
+    #cameraContainer { position: relative; width: 100%; max-width: 400px; margin: 0 auto; background: #000; overflow: hidden; border-radius: 8px; }
+    #videoElement { width: 100%; height: auto; display: block; object-fit: cover; }
+    
+    .overlay-box {
+      position: absolute;
+      border: 3px solid red;
+      box-sizing: border-box;
+      pointer-events: none;
+    }
+    .overlay-label {
+      position: absolute;
+      background: red;
+      color: white;
+      font-size: 11px;
+      padding: 1px 4px;
+      font-weight: bold;
+    }
+    #captureBtn { background: #28a745; font-size: 18px; padding: 15px; margin-top: 10px; display: none; }
+  </style>
+</head>
+<body>
+
+  <h2>パッケージ照合アプリ</h2>
+
+  <div class="card">
+    <label>1. パッケージを選択</label>
+    <select id="packageSelect">
+      <option value="">-- 読み込み中... --</option>
+    </select>
+  </div>
+
+  <div class="card" id="cameraCard" style="display:none;">
+    <label>2. 赤枠の中に文字を合わせて撮影</label>
+    
+    <div id="cameraContainer">
+      <video id="videoElement" autoplay playsinline muted></video>
+      <div id="boxA" class="overlay-box"><span class="overlay-label">A位置</span></div>
+      <div id="boxB" class="overlay-box"><span class="overlay-label">B位置</span></div>
+    </div>
+    
+    <button id="captureBtn">この位置で撮影・判定する</button>
+  </div>
+
+  <div class="card" id="resultArea" style="display:none;">
+    <h3>判定結果</h3>
+    <p>A位置の文字: <span id="textAVal">-</span></p>
+    <p>B位置の文字: <span id="textBVal">-</span></p>
+    <p>判定: <span id="finalResult">-</span></p>
+    <button id="retryBtn" style="background:#6c757d; margin-top:10px;">次の商品を撮影する</button>
+  </div>
+
+  <script>
+    // ★ここにステップ2で取得したGASのウェブアプリURLを貼り付けてください
+    const GAS_API_URL = 'https://script.google.com/macros/s/AKfycbxEFZK6SfG4UDt5zFo37VM3NvjL6is3OSV7RlDfhsMV0L2qGppRJ8fFucuvN6a3WOa5/exec';
+
+    let masterData = [];
+    let mediaStream = null;
+    const video = document.getElementById('videoElement');
+
+    window.onload = async function() {
+      try {
+        const res = await fetch(GAS_API_URL);
+        const json = await res.json();
+        if (json.status === "success") {
+          masterData = json.data;
+          const select = document.getElementById('packageSelect');
+          select.innerHTML = '<option value="">-- パッケージを選択してください --</option>';
+          masterData.forEach(item => {
+            const opt = document.createElement('option');
+            opt.value = item.packageId;
+            opt.textContent = `${item.packageId}: ${item.packageName}`;
+            select.appendChild(opt);
+          });
+        } else {
+          alert("マスターデータの取得に失敗しました: " + json.message);
+        }
+      } catch (err) {
+        alert("通信エラー: " + err.message);
+      }
+    };
+
+    document.getElementById('packageSelect').addEventListener('change', async function() {
+      const selectedId = this.value;
+      if (!selectedId) {
+        document.getElementById('cameraCard').style.display = 'none';
+        stopCamera();
+        return;
+      }
+
+      document.getElementById('cameraCard').style.display = 'block';
+      document.getElementById('resultArea').style.display = 'none';
+      await startCamera();
+    });
+
+    async function startCamera() {
+      try {
+        if (mediaStream) stopCamera();
+        
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: "environment" } },
+          audio: false
+        });
+        
+        video.srcObject = mediaStream;
+        await video.play();
+        
+        video.onloadedmetadata = () => {
+          updateOverlayBoxes();
+          document.getElementById('captureBtn').style.display = 'block';
+        };
+        if (video.videoWidth > 0) {
+          updateOverlayBoxes();
+          document.getElementById('captureBtn').style.display = 'block';
+        }
+      } catch (err) {
+        alert("カメラを起動できませんでした。ブラウザのカメラ権限をご確認ください。詳細: " + err.message);
+      }
+    }
+
+    function stopCamera() {
+      if (mediaStream) {
+        mediaStream.getTracks().forEach(track => track.stop());
+        mediaStream = null;
+      }
+    }
+
+    function updateOverlayBoxes() {
+      const selectedId = document.getElementById('packageSelect').value;
+      const pkg = masterData.find(item => item.packageId === selectedId);
+      if (!pkg) return;
+
+      const container = document.getElementById('cameraContainer');
+      const cW = container.clientWidth;
+      const vW = video.videoWidth || 640;
+      const vH = video.videoHeight || 480;
+      const cH = (vH / vW) * cW;
+      
+      container.style.height = cH + 'px';
+
+      setBox('boxA', pkg.a, cW, cH);
+      setBox('boxB', pkg.b, cW, cH);
+    }
+
+    function setBox(boxId, area, cW, cH) {
+      const box = document.getElementById(boxId);
+      box.style.left = (area.x / 100) * cW + 'px';
+      box.style.top = (area.y / 100) * cH + 'px';
+      box.style.width = (area.w / 100) * cW + 'px';
+      box.style.height = (area.h / 100) * cH + 'px';
+    }
+
+    document.getElementById('captureBtn').addEventListener('click', async function() {
+      const selectedId = document.getElementById('packageSelect').value;
+      const pkg = masterData.find(item => item.packageId === selectedId);
+
+      document.getElementById('textAVal').textContent = "解析中...";
+      document.getElementById('textBVal').textContent = "解析中...";
+      document.getElementById('resultArea').style.display = 'block';
+      document.getElementById('cameraCard').style.display = 'none';
+      stopCamera();
+
+      const canvas = document.createElement('canvas');
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      const imgW = canvas.width;
+      const imgH = canvas.height;
+
+      const base64A = cropToCanvasBase64(canvas, imgW, imgH, pkg.a);
+      const base64B = cropToCanvasBase64(canvas, imgW, imgH, pkg.b);
+
+      try {
+        const response = await fetch(GAS_API_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify({
+            packageId: selectedId,
+            base64A: base64A,
+            base64B: base64B
+          })
+        });
+        const res = await response.json();
+        if (res.status === "success") {
+          document.getElementById('textAVal').textContent = res.textA;
+          document.getElementById('textBVal').textContent = res.textB;
+
+          const resEl = document.getElementById('finalResult');
+          resEl.textContent = res.result;
+          resEl.className = (res.result === "OK") ? "result-ok" : "result-ng";
+        } else {
+          alert("サーバーエラー: " + res.message);
+        }
+      } catch (err) {
+        alert("通信エラーが発生しました: " + err.message);
+      }
+    });
+
+    function cropToCanvasBase64(sourceCanvas, imgW, imgH, area) {
+      const canvas = document.createElement('canvas');
+      const x = (area.x / 100) * imgW;
+      const y = (area.y / 100) * imgH;
+      const w = (area.w / 100) * imgW;
+      const h = (area.h / 100) * imgH;
+
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(sourceCanvas, x, y, w, h, 0, 0, w, h);
+      
+      return canvas.toDataURL('image/jpeg', 0.8);
+    }
+
+    document.getElementById('retryBtn').addEventListener('click', async function() {
+      document.getElementById('resultArea').style.display = 'none';
+      document.getElementById('cameraCard').style.display = 'block';
+      await startCamera();
+    });
+  </script>
+
+</body>
+</html>
