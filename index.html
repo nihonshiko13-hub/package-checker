@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>パッケージ照合アプリ（外部版）</title>
+  <title>パッケージ照合アプリ</title>
   <style>
     body { font-family: sans-serif; padding: 15px; background: #f4f4f9; color: #333; text-align: center; }
     .card { background: #fff; padding: 15px; border-radius: 8px; margin-bottom: 15px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); text-align: left; }
@@ -40,7 +40,7 @@
   <div class="card">
     <label>1. パッケージを選択</label>
     <select id="packageSelect">
-      <option value="">-- 読み込み中... --</option>
+      <option value="">-- パッケージを選択してください --</option>
     </select>
   </div>
 
@@ -65,32 +65,30 @@
   </div>
 
   <script>
-    // ★ここにステップ2で取得したGASのウェブアプリURLを貼り付けてください
-    const GAS_API_URL = 'https://script.google.com/macros/s/AKfycbxEFZK6SfG4UDt5zFo37VM3NvjL6is3OSV7RlDfhsMV0L2qGppRJ8fFucuvN6a3WOa5/exec';
+    // ▼ここにあなたのGASウェブアプリのURLを貼り付けてください
+    const GAS_API_URL = 'https://script.google.com/macros/s/AKfycbz_D-40STxw3hyktwEJ-icweDivS6voVd62tmsTB-BjkBvmldx5JZIMDGl_2nilrCSb/exec';
 
     let masterData = [];
     let mediaStream = null;
     const video = document.getElementById('videoElement');
 
+    // 起動時にGASからマスターデータを取得
     window.onload = async function() {
       try {
-        const res = await fetch(GAS_API_URL);
-        const json = await res.json();
-        if (json.status === "success") {
-          masterData = json.data;
+        const response = await fetch(GAS_API_URL);
+        const result = await response.json();
+        if (result.status === "success") {
+          masterData = result.data;
           const select = document.getElementById('packageSelect');
-          select.innerHTML = '<option value="">-- パッケージを選択してください --</option>';
           masterData.forEach(item => {
             const opt = document.createElement('option');
             opt.value = item.packageId;
             opt.textContent = `${item.packageId}: ${item.packageName}`;
             select.appendChild(opt);
           });
-        } else {
-          alert("マスターデータの取得に失敗しました: " + json.message);
         }
       } catch (err) {
-        alert("通信エラー: " + err.message);
+        alert("マスターデータの取得に失敗しました: " + err.message);
       }
     };
 
@@ -112,7 +110,7 @@
         if (mediaStream) stopCamera();
         
         mediaStream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: { ideal: "environment" } },
+          video: { facingMode: "environment" },
           audio: false
         });
         
@@ -128,7 +126,7 @@
           document.getElementById('captureBtn').style.display = 'block';
         }
       } catch (err) {
-        alert("カメラを起動できませんでした。ブラウザのカメラ権限をご確認ください。詳細: " + err.message);
+        alert("カメラの起動に失敗しました: " + err.message);
       }
     }
 
@@ -189,7 +187,6 @@
       try {
         const response = await fetch(GAS_API_URL, {
           method: 'POST',
-          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
           body: JSON.stringify({
             packageId: selectedId,
             base64A: base64A,
@@ -197,16 +194,13 @@
           })
         });
         const res = await response.json();
-        if (res.status === "success") {
-          document.getElementById('textAVal').textContent = res.textA;
-          document.getElementById('textBVal').textContent = res.textB;
 
-          const resEl = document.getElementById('finalResult');
-          resEl.textContent = res.result;
-          resEl.className = (res.result === "OK") ? "result-ok" : "result-ng";
-        } else {
-          alert("サーバーエラー: " + res.message);
-        }
+        document.getElementById('textAVal').textContent = res.textA || "(なし)";
+        document.getElementById('textBVal').textContent = res.textB || "(なし)";
+
+        const resEl = document.getElementById('finalResult');
+        resEl.textContent = res.result;
+        resEl.className = (res.result === "OK") ? "result-ok" : "result-ng";
       } catch (err) {
         alert("通信エラーが発生しました: " + err.message);
       }
