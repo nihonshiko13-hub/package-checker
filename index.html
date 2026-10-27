@@ -181,8 +181,9 @@
       const imgW = canvas.width;
       const imgH = canvas.height;
 
-      const base64A = cropToCanvasBase64(canvas, imgW, imgH, pkg.a);
-      const base64B = cropToCanvasBase64(canvas, imgW, imgH, pkg.b);
+      const fullImageBase64 = canvas.toDataURL('image/jpeg', 0.8);
+      const base64A = fullImageBase64;
+      const base64B = fullImageBase64;
 
       try {
         const response = await fetch(GAS_API_URL, {
