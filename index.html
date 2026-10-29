@@ -4,6 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>パッケージ照合アプリ</title>
+  <!-- ▼ Tesseract.js のCDNスクリプトを追加 -->
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
   <style>
     body { font-family: sans-serif; padding: 15px; background: #f4f4f9; color: #333; text-align: center; }
     .card { background: #fff; padding: 15px; border-radius: 8px; margin-bottom: 15px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); text-align: left; }
@@ -64,15 +66,16 @@
     <button id="retryBtn" style="background:#6c757d; margin-top:10px;">次の商品を撮影する</button>
   </div>
 
-  <script>
-    // ▼ここにあなたのGASウェブアプリのURLを貼り付けてください
-    const GAS_API_URL = 'https://script.google.com/macros/s/AKfycbwFjuNOwaJP9l1HBC28qtYabseuU07b9QY_b6NIcwW4qP6fTiAyjZae1Z_u7-YMwCmc/exec';
-
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<script>
+    // ▼ マスターデータ（※必要であれば初期のまま、あるいは必要に応じて保持）
     let masterData = [];
     let mediaStream = null;
     const video = document.getElementById('videoElement');
 
-    // 起動時にGASからマスターデータを取得
+    // 起動時にGASからマスターデータを取得（※マスターデータの取得のみGASのままで行います）
+    const GAS_API_URL = 'https://script.google.com/macros/s/AKfycbz_D-40STxw3hyktwEJ-icweDivS6voVd62tmsTB-BjkBvmldx5JZIMDGl_2nilrCSb/exec';
+
     window.onload = async function() {
       try {
         const response = await fetch(GAS_API_URL);
@@ -162,6 +165,7 @@
       box.style.height = (area.h / 100) * cH + 'px';
     }
 
+    // 撮影・判定ボタン（Tesseract.jsでブラウザ内OCRを実行）
     document.getElementById('captureBtn').addEventListener('click', async function() {
       const selectedId = document.getElementById('packageSelect').value;
       const pkg = masterData.find(item => item.packageId === selectedId);
@@ -172,6 +176,7 @@
       document.getElementById('cameraCard').style.display = 'none';
       stopCamera();
 
+      // カメラ映像をキャンバスに描き出し
       const canvas = document.createElement('canvas');
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
@@ -181,29 +186,37 @@
       const imgW = canvas.width;
       const imgH = canvas.height;
 
-      const fullImageBase64 = canvas.toDataURL('image/jpeg', 0.8);
-      const base64A = fullImageBase64;
-      const base64B = fullImageBase64;
-
       try {
-        const response = await fetch(GAS_API_URL, {
-          method: 'POST',
-          body: JSON.stringify({
-            packageId: selectedId,
-            base64A: base64A,
-            base64B: base64B
-          })
+        // A位置とB位置をそれぞれの座標で切り抜く
+        const base64A = cropToCanvasBase64(canvas, imgW, imgH, pkg.a);
+        const base64B = cropToCanvasBase64(canvas, imgW, imgH, pkg.b);
+
+        // Tesseract.jsでA位置を解析
+        const resultA = await Tesseract.recognize(base64A, 'eng+jpn', {
+          logger: m => console.log(m)
         });
-        const res = await response.json();
+        const textA = resultA.data.text.trim();
 
-        document.getElementById('textAVal').textContent = res.textA || "(なし)";
-        document.getElementById('textBVal').textContent = res.textB || "(なし)";
+        // Tesseract.jsでB位置を解析
+        const resultB = await Tesseract.recognize(base64B, 'eng+jpn', {
+          logger: m => console.log(m)
+        });
+        const textB = resultB.data.text.trim();
 
+        document.getElementById('textAVal').textContent = textA || "(なし)";
+        document.getElementById('textBVal').textContent = textB || "(なし)";
+
+        // 簡易的なOK/NG判定（例: AとBの両方のテキストが取得できているか、または期待値との一致など）
+        // ※必要に応じて判定ロジックは調整可能です
+        const isMatch = (textA.length > 0 && textB.length > 0); 
         const resEl = document.getElementById('finalResult');
-        resEl.textContent = res.result;
-        resEl.className = (res.result === "OK") ? "result-ok" : "result-ng";
+        resEl.textContent = isMatch ? "OK" : "NG";
+        resEl.className = isMatch ? "result-ok" : "result-ng";
+
       } catch (err) {
-        alert("通信エラーが発生しました: " + err.message);
+        alert("OCR処理エラーが発生しました: " + err.message);
+        document.getElementById('textAVal').textContent = "(エラー)";
+        document.getElementById('textBVal').textContent = "(エラー)";
       }
     });
 
@@ -219,13 +232,13 @@
       const ctx = canvas.getContext('2d');
       ctx.drawImage(sourceCanvas, x, y, w, h, 0, 0, w, h);
       
-      return canvas.toDataURL('image/jpeg', 0.8);
+      return canvas.toDataURL('image/jpeg', 0.9);
     }
 
     document.getElementById('retryBtn').addEventListener('click', async function() {
       document.getElementById('resultArea').style.display = 'none';
       document.getElementById('cameraCard').style.display = 'block';
-      await startCamera();
+      await startCard = await startCamera();
     });
   </script>
 
