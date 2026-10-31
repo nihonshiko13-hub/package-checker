@@ -81,20 +81,24 @@
         const response = await fetch(GAS_API_URL);
         const result = await response.json();
         
-        // ▼ 届いたデータをコンソールに表示して確認する
         console.log("【デバッグ】GASからの受信データ:", result);
 
         if (result.status === "success") {
           masterData = result.data;
           const select = document.getElementById('packageSelect');
+          
+          // ▼ 選択肢を一度リセットしてから綺麗に追加する
+          select.innerHTML = '<option value="">-- パッケージを選択してください --</option>';
+
           masterData.forEach(item => {
             const opt = document.createElement('option');
             opt.value = item.packageId;
             opt.textContent = `${item.packageId}: ${item.packageName}`;
             select.appendChild(opt);
+            console.log("【デバッグ】追加成功:", opt.textContent);
           });
         } else {
-          console.warn("【デバッグ】statusがsuccessではありません。中身を確認してください。");
+          console.warn("【デバッグ】statusがsuccessではありません。");
         }
       } catch (err) {
         alert("マスターデータの取得に失敗しました: " + err.message);
