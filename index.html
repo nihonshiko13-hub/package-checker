@@ -202,13 +202,13 @@
         const base64B = cropToCanvasBase64(canvas, imgW, imgH, pkg.b);
 
         // Tesseract.jsでA位置を解析
-        const resultA = await Tesseract.recognize(base64A, 'eng+jpn', {
+        const resultA = await Tesseract.recognize(base64A, 'eng', {
           logger: m => console.log(m)
         });
         const textA = resultA.data.text.trim();
 
         // Tesseract.jsでB位置を解析
-        const resultB = await Tesseract.recognize(base64B, 'eng+jpn', {
+        const resultB = await Tesseract.recognize(base64B, 'eng', {
           logger: m => console.log(m)
         });
         const textB = resultB.data.text.trim();
