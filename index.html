@@ -1,256 +1,245 @@
 <!DOCTYPE html>
-<html>
+<html lang="ja">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>パッケージ照合アプリ</title>
-  <!-- ▼ Tesseract.js のCDNスクリプトを追加 -->
   <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
   <style>
-    body { font-family: sans-serif; padding: 15px; background: #f4f4f9; color: #333; text-align: center; }
-    .card { background: #fff; padding: 15px; border-radius: 8px; margin-bottom: 15px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); text-align: left; }
-    select, button { width: 100%; padding: 12px; margin-top: 5px; margin-bottom: 15px; font-size: 16px; box-sizing: border-box; }
-    button { background: #007bff; color: white; border: none; border-radius: 4px; font-weight: bold; cursor: pointer; }
-    button:active { background: #0056b3; }
-    .result-ok { color: green; font-size: 24px; font-weight: bold; }
-    .result-ng { color: red; font-size: 24px; font-weight: bold; }
-    
-    #cameraContainer { position: relative; width: 100%; max-width: 400px; margin: 0 auto; background: #000; overflow: hidden; border-radius: 8px; }
-    #videoElement { width: 100%; height: auto; display: block; object-fit: cover; }
-    
-    .overlay-box {
-      position: absolute;
-      border: 3px solid red;
-      box-sizing: border-box;
-      pointer-events: none;
-    }
-    .overlay-label {
-      position: absolute;
-      background: red;
-      color: white;
-      font-size: 11px;
-      padding: 1px 4px;
-      font-weight: bold;
-    }
-    #captureBtn { background: #28a745; font-size: 18px; padding: 15px; margin-top: 10px; display: none; }
+    * { box-sizing: border-box; }
+    body { font-family: sans-serif; margin: 0 auto; padding: 16px; max-width: 600px; background: #f4f4f9; color: #333; }
+    h1 { font-size: 24px; }
+    .card { background: white; padding: 16px; border-radius: 8px; margin-bottom: 16px; }
+    label { display: block; margin-bottom: 6px; }
+    select, button { width: 100%; padding: 12px; font-size: 16px; margin-bottom: 12px; }
+    button { background: #007bff; color: white; border: 0; border-radius: 4px; font-weight: bold; }
+    button:disabled { opacity: .5; }
+    #cameraContainer { position: relative; width: 100%; background: black; overflow: hidden; }
+    video { display: block; width: 100%; height: auto; }
+    .overlay-box { position: absolute; border: 3px solid red; pointer-events: none; }
+    .overlay-label { background: red; color: white; font-size: 11px; padding: 1px 4px; }
+    #captureBtn { background: #238636; margin-top: 12px; }
+    #status { white-space: pre-wrap; overflow-wrap: anywhere; }
+    #finalResult { font-size: 28px; font-weight: bold; }
+    .ok { color: #16803c; } .ng { color: #c62828; } .pending { color: #775400; }
+    .previews { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .previews img { display: block; width: 100%; border: 1px solid #aaa; background: #eee; }
+    .ocr-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+    small { display: block; line-height: 1.6; margin-bottom: 12px; }
+    [hidden] { display: none !important; }
   </style>
 </head>
 <body>
-
-  <h2>パッケージ照合アプリ</h2>
-
+  <h1>パッケージ照合アプリ</h1>
   <div class="card">
-    <label>1. パッケージを選択</label>
-    <select id="packageSelect">
-      <option value="">-- パッケージを選択してください --</option>
+    <label for="packageSelect">1. パッケージを選択</label>
+    <select id="packageSelect" disabled><option value="">読み込み中…</option></select>
+    <label for="languageSelect">読み取る文字</label>
+    <select id="languageSelect">
+      <option value="eng">英字・数字</option>
+      <option value="jpn+eng">日本語・英字・数字</option>
     </select>
+    <small>前後の空白を除いて比較します。文字内の空白・改行・大小文字・全角半角は区別します。</small>
+    <p id="status" role="status" aria-live="polite">マスターを読み込んでいます。</p>
   </div>
-
-  <div class="card" id="cameraCard" style="display:none;">
-    <label>2. 赤枠の中に文字を合わせて撮影</label>
-    
+  <div class="card" id="cameraCard" hidden>
+    <p>2. 赤枠の中に文字を合わせて撮影</p>
     <div id="cameraContainer">
       <video id="videoElement" autoplay playsinline muted></video>
       <div id="boxA" class="overlay-box"><span class="overlay-label">A位置</span></div>
       <div id="boxB" class="overlay-box"><span class="overlay-label">B位置</span></div>
     </div>
-    
-    <button id="captureBtn">この位置で撮影・判定する</button>
+    <button id="captureBtn" disabled>この位置で撮影・判定する</button>
   </div>
-
-  <div class="card" id="resultArea" style="display:none;">
-    <h3>判定結果</h3>
-    <p>A位置の文字: <span id="textAVal">-</span></p>
-    <p>B位置の文字: <span id="textBVal">-</span></p>
-    <p>判定: <span id="finalResult">-</span></p>
-    <button id="retryBtn" style="background:#6c757d; margin-top:10px;">次の商品を撮影する</button>
+  <div class="card" id="resultArea" hidden>
+    <h2>判定結果</h2>
+    <div class="previews">
+      <div><p>Aの切り抜き画像</p><img id="previewA" alt="A位置の切り抜き画像"></div>
+      <div><p>Bの切り抜き画像</p><img id="previewB" alt="B位置の切り抜き画像"></div>
+    </div>
+    <p>A位置の文字：<span id="textAVal" class="ocr-text">-</span></p>
+    <p>B位置の文字：<span id="textBVal" class="ocr-text">-</span></p>
+    <p>判定：<span id="finalResult" class="pending">未判定</span></p>
+    <button id="retryBtn">もう一度撮影する</button>
   </div>
-
-  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
-<script>
-    // ▼ マスターデータ（※必要であれば初期のまま、あるいは必要に応じて保持）
+  <script>
+    const GAS_API_URL = 'https://script.google.com/macros/s/AKfycbz_D-40STxw3hyktwEJ-icweDivS6voVd62tmsTB-BjkBvmldx5JZIMDGl_2nilrCSb/exec';
+    const el = id => document.getElementById(id);
+    const video = el('videoElement');
     let masterData = [];
     let mediaStream = null;
-    const video = document.getElementById('videoElement');
-
-    // 起動時にGASからマスターデータを取得（※マスターデータの取得のみGASのままで行います）
-    const GAS_API_URL = 'https://script.google.com/macros/s/AKfycbz_D-40STxw3hyktwEJ-icweDivS6voVd62tmsTB-BjkBvmldx5JZIMDGl_2nilrCSb/exec';
-
-    window.onload = async function() {
-      try {
-        const response = await fetch(GAS_API_URL);
-        const result = await response.json();
-        
-        console.log("【デバッグ】GASからの受信データ:", result);
-
-        if (result.status === "success") {
-          masterData = result.data;
-          const select = document.getElementById('packageSelect');
-          
-          // ▼ 選択肢を一度リセットしてから綺麗に追加する
-          select.innerHTML = '<option value="">-- パッケージを選択してください --</option>';
-
-          masterData.forEach(item => {
-            const opt = document.createElement('option');
-            opt.value = item.packageId;
-            opt.textContent = `${item.packageId}: ${item.packageName}`;
-            select.appendChild(opt);
-            console.log("【デバッグ】追加成功:", opt.textContent);
-          });
-        } else {
-          console.warn("【デバッグ】statusがsuccessではありません。");
-        }
-      } catch (err) {
-        alert("マスターデータの取得に失敗しました: " + err.message);
-      }
-    };
-
-    document.getElementById('packageSelect').addEventListener('change', async function() {
-      const selectedId = this.value;
-      if (!selectedId) {
-        document.getElementById('cameraCard').style.display = 'none';
-        stopCamera();
-        return;
-      }
-
-      document.getElementById('cameraCard').style.display = 'block';
-      document.getElementById('resultArea').style.display = 'none';
-      await startCamera();
-    });
-
-    async function startCamera() {
-      try {
-        if (mediaStream) stopCamera();
-        
-        mediaStream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: "environment" },
-          audio: false
-        });
-        
-        video.srcObject = mediaStream;
-        await video.play();
-        
-        video.onloadedmetadata = () => {
-          updateOverlayBoxes();
-          document.getElementById('captureBtn').style.display = 'block';
-        };
-        if (video.videoWidth > 0) {
-          updateOverlayBoxes();
-          document.getElementById('captureBtn').style.display = 'block';
-        }
-      } catch (err) {
-        alert("カメラの起動に失敗しました: " + err.message);
-      }
+    let busy = false;
+    let cameraGeneration = 0;
+    function status(message) { el('status').textContent = message; }
+    function selectedPackage() {
+      return masterData.find(item => String(item.packageId) === el('packageSelect').value);
     }
-
+    function validateArea(area, label) {
+      if (!area || ['x', 'y', 'w', 'h'].some(key => !Number.isFinite(Number(area[key])))) {
+        throw new Error(label + '：マスターの座標が数値ではありません。');
+      }
+      const { x, y, w, h } = Object.fromEntries(['x', 'y', 'w', 'h'].map(key => [key, Number(area[key])]));
+      if (x < 0 || y < 0 || w <= 0 || h <= 0 || x + w > 100 || y + h > 100) {
+        throw new Error(label + '：座標は画像全体に対する0～100の割合で指定してください。幅・高さは0より大きく、枠は画像内に収めてください。');
+      }
+      return { x, y, w, h };
+    }
     function stopCamera() {
-      if (mediaStream) {
-        mediaStream.getTracks().forEach(track => track.stop());
-        mediaStream = null;
-      }
+      cameraGeneration++;
+      if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
+      mediaStream = null;
+      video.srcObject = null;
+      el('captureBtn').disabled = true;
     }
-
     function updateOverlayBoxes() {
-      const selectedId = document.getElementById('packageSelect').value;
-      const pkg = masterData.find(item => item.packageId === selectedId);
+      const pkg = selectedPackage();
       if (!pkg) return;
-
-      const container = document.getElementById('cameraContainer');
-      const cW = container.clientWidth;
-      const vW = video.videoWidth || 640;
-      const vH = video.videoHeight || 480;
-      const cH = (vH / vW) * cW;
-      
-      container.style.height = cH + 'px';
-
-      setBox('boxA', pkg.a, cW, cH);
-      setBox('boxB', pkg.b, cW, cH);
-    }
-
-    function setBox(boxId, area, cW, cH) {
-      const box = document.getElementById(boxId);
-      box.style.left = (area.x / 100) * cW + 'px';
-      box.style.top = (area.y / 100) * cH + 'px';
-      box.style.width = (area.w / 100) * cW + 'px';
-      box.style.height = (area.h / 100) * cH + 'px';
-    }
-
-    // 撮影・判定ボタン（Tesseract.jsでブラウザ内OCRを実行）
-    document.getElementById('captureBtn').addEventListener('click', async function() {
-      const selectedId = document.getElementById('packageSelect').value;
-      const pkg = masterData.find(item => item.packageId === selectedId);
-
-      document.getElementById('textAVal').textContent = "解析中...";
-      document.getElementById('textBVal').textContent = "解析中...";
-      document.getElementById('resultArea').style.display = 'block';
-      document.getElementById('cameraCard').style.display = 'none';
-      stopCamera();
-
-      // カメラ映像をキャンバスに描き出し
-      const canvas = document.createElement('canvas');
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      const ctx = canvas.getContext('2d');
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-      const imgW = canvas.width;
-      const imgH = canvas.height;
-
-      try {
-        // A位置とB位置をそれぞれの座標で切り抜く
-        const base64A = cropToCanvasBase64(canvas, imgW, imgH, pkg.a);
-        const base64B = cropToCanvasBase64(canvas, imgW, imgH, pkg.b);
-
-        // Tesseract.jsでA位置を解析
-        const resultA = await Tesseract.recognize(base64A, 'eng', {
-          logger: m => console.log(m)
-        });
-        const textA = resultA.data.text.trim();
-
-        // Tesseract.jsでB位置を解析
-        const resultB = await Tesseract.recognize(base64B, 'eng', {
-          logger: m => console.log(m)
-        });
-        const textB = resultB.data.text.trim();
-
-        document.getElementById('textAVal').textContent = textA || "(なし)";
-        document.getElementById('textBVal').textContent = textB || "(なし)";
-
-        // 簡易的なOK/NG判定（例: AとBの両方のテキストが取得できているか、または期待値との一致など）
-        // ※必要に応じて判定ロジックは調整可能です
-        const isMatch = (textA.length > 0 && textB.length > 0); 
-        const resEl = document.getElementById('finalResult');
-        resEl.textContent = isMatch ? "OK" : "NG";
-        resEl.className = isMatch ? "result-ok" : "result-ng";
-
-      } catch (err) {
-        alert("OCR処理エラーが発生しました: " + err.message);
-        document.getElementById('textAVal').textContent = "(エラー)";
-        document.getElementById('textBVal').textContent = "(エラー)";
+      for (const [id, area] of [['boxA', pkg.a], ['boxB', pkg.b]]) {
+        const a = validateArea(area, id === 'boxA' ? 'A' : 'B');
+        Object.assign(el(id).style, { left: a.x + '%', top: a.y + '%', width: a.w + '%', height: a.h + '%' });
       }
-    });
-
-    function cropToCanvasBase64(sourceCanvas, imgW, imgH, area) {
+    }
+    async function startCamera() {
+      stopCamera();
+      const generation = cameraGeneration;
+      try {
+        updateOverlayBoxes();
+        status('カメラを起動しています。');
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false
+        });
+        if (generation !== cameraGeneration) {
+          stream.getTracks().forEach(track => track.stop());
+          return;
+        }
+        mediaStream = stream;
+        video.srcObject = stream;
+        await video.play();
+        if (generation !== cameraGeneration) return;
+        el('captureBtn').disabled = false;
+        status('赤枠に文字を合わせ、ピントが合ってから撮影してください。');
+      } catch (error) {
+        if (generation !== cameraGeneration) return;
+        stopCamera();
+        status('カメラ起動エラー：' + error.message + '\nパッケージを選び直して再試行してください。');
+      }
+    }
+    function cropToCanvasBase64(source, area, label) {
+      const a = validateArea(area, label);
+      const x = Math.round(source.width * a.x / 100);
+      const y = Math.round(source.height * a.y / 100);
+      const w = Math.min(Math.round(source.width * a.w / 100), source.width - x);
+      const h = Math.min(Math.round(source.height * a.h / 100), source.height - y);
+      if (w < 1 || h < 1) throw new Error(label + '：切り抜き画像が小さすぎます。');
       const canvas = document.createElement('canvas');
-      const x = (area.x / 100) * imgW;
-      const y = (area.y / 100) * imgH;
-      const w = (area.w / 100) * imgW;
-      const h = (area.h / 100) * imgH;
-
       canvas.width = w;
       canvas.height = h;
-      const ctx = canvas.getContext('2d');
-      ctx.drawImage(sourceCanvas, x, y, w, h, 0, 0, w, h);
-      
-      return canvas.toDataURL('image/jpeg', 0.9);
+      canvas.getContext('2d').drawImage(source, x, y, w, h, 0, 0, w, h);
+      return canvas.toDataURL('image/png');
     }
-
-    document.getElementById('retryBtn').addEventListener('click', async function() {
-      document.getElementById('resultArea').style.display = 'none';
-      document.getElementById('cameraCard').style.display = 'block';
+    function setResult(text, className = 'pending') {
+      el('finalResult').textContent = text;
+      el('finalResult').className = className;
+    }
+    el('packageSelect').addEventListener('change', async () => {
+      el('resultArea').hidden = true;
+      el('cameraCard').hidden = !selectedPackage();
+      if (selectedPackage()) await startCamera();
+      else { stopCamera(); status('パッケージを選択してください。'); }
+    });
+    el('captureBtn').addEventListener('click', async () => {
+      if (busy) return;
+      busy = true;
+      el('captureBtn').disabled = true;
+      el('packageSelect').disabled = true;
+      el('languageSelect').disabled = true;
+      el('retryBtn').disabled = true;
+      el('resultArea').hidden = true;
+      el('previewA').removeAttribute('src');
+      el('previewB').removeAttribute('src');
+      el('textAVal').textContent = '未読取';
+      el('textBVal').textContent = '未読取';
+      setResult('未判定');
+      try {
+        const pkg = selectedPackage();
+        if (!pkg) throw new Error('パッケージが選択されていません。');
+        if (video.readyState < 2 || video.videoWidth < 1 || video.videoHeight < 1) {
+          throw new Error('映像の準備ができていません。もう一度撮影してください。');
+        }
+        // 映像が動いている間に、同じ1フレームを保存する。
+        const frame = document.createElement('canvas');
+        frame.width = video.videoWidth;
+        frame.height = video.videoHeight;
+        frame.getContext('2d').drawImage(video, 0, 0);
+        const imageA = cropToCanvasBase64(frame, pkg.a, 'A');
+        const imageB = cropToCanvasBase64(frame, pkg.b, 'B');
+        el('previewA').src = imageA;
+        el('previewB').src = imageB;
+        // フレーム保存・切り抜き後にカメラを停止する。
+        stopCamera();
+        el('cameraCard').hidden = true;
+        el('resultArea').hidden = false;
+        if (typeof Tesseract === 'undefined') throw new Error('文字認識ライブラリを読み込めません。通信環境を確認してください。');
+        const language = el('languageSelect').value;
+        const recognize = async (image, label) => {
+          status(label + 'の文字を認識しています。初回は認識データの読み込みに時間がかかります。');
+          const result = await Tesseract.recognize(image, language, {
+            logger: m => {
+              const percent = Number.isFinite(m.progress) ? ' ' + Math.round(m.progress * 100) + '%' : '';
+              status(label + 'を解析中：' + m.status + percent);
+            }
+          });
+          return result.data.text.trim();
+        };
+        const textA = await recognize(imageA, 'A');
+        el('textAVal').textContent = textA || '（文字未検出）';
+        const textB = await recognize(imageB, 'B');
+        el('textBVal').textContent = textB || '（文字未検出）';
+        if (!textA || !textB) {
+          setResult('読取不可');
+          status('文字を検出できませんでした。下の切り抜き画像に対象の文字が鮮明に写っているか確認してください。');
+        } else {
+          const same = textA === textB;
+          setResult(same ? 'OK' : 'NG', same ? 'ok' : 'ng');
+          status(same ? 'A・Bの認識文字が一致しました。' : 'A・Bの認識文字が異なります。表示された文字を確認してください。');
+        }
+      } catch (error) {
+        setResult('処理エラー');
+        el('resultArea').hidden = false;
+        status('処理エラー：' + error.message);
+      } finally {
+        busy = false;
+        el('packageSelect').disabled = false;
+        el('languageSelect').disabled = false;
+        el('retryBtn').disabled = false;
+        el('captureBtn').disabled = !mediaStream;
+      }
+    });
+    el('retryBtn').addEventListener('click', async () => {
+      if (busy || !selectedPackage()) return;
+      el('resultArea').hidden = true;
+      el('cameraCard').hidden = false;
       await startCamera();
     });
+    window.addEventListener('pagehide', stopCamera);
+    (async () => {
+      try {
+        const response = await fetch(GAS_API_URL);
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        const result = await response.json();
+        if (result.status !== 'success' || !Array.isArray(result.data)) {
+          throw new Error(result.message || 'マスターの応答形式が正しくありません。');
+        }
+        masterData = result.data;
+        el('packageSelect').replaceChildren(new Option('-- パッケージを選択してください --', ''));
+        masterData.forEach(item => el('packageSelect').appendChild(new Option(item.packageId + ': ' + item.packageName, String(item.packageId))));
+        el('packageSelect').disabled = false;
+        status(masterData.length ? 'パッケージを選択してください。' : 'マスターが0件です。Masterシートを確認してください。');
+      } catch (error) {
+        el('packageSelect').replaceChildren(new Option('マスター取得失敗', ''));
+        status('マスター取得エラー：' + error.message + '\n通信環境とApps Scriptの公開設定を確認してください。');
+      }
+    })();
   </script>
-
 </body>
 </html>
