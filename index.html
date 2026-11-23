@@ -60,6 +60,8 @@
     <p>A位置の文字：<span id="textAVal" class="ocr-text">-</span></p>
     <p>B位置の文字：<span id="textBVal" class="ocr-text">-</span></p>
     <p>判定：<span id="finalResult" class="pending">未判定</span></p>
+    <p id="saveStatus" role="status" aria-live="polite">履歴：未保存</p>
+    <button id="saveRetryBtn" hidden>履歴の保存を再試行する</button>
     <button id="retryBtn">もう一度撮影する</button>
   </div>
   <script>
@@ -70,6 +72,53 @@
     let mediaStream = null;
     let busy = false;
     let cameraGeneration = 0;
+    let logApiReady = false;
+    let pendingRecord = null;
+    let saving = false;
+    function updateSaveControls() {
+      el('saveRetryBtn').hidden = !pendingRecord || saving;
+      el('retryBtn').disabled = busy || saving || !!pendingRecord;
+      el('packageSelect').disabled = busy || saving || !!pendingRecord;
+      el('captureBtn').disabled = busy || saving || !!pendingRecord || !mediaStream;
+    }
+    async function savePendingRecord() {
+      if (!pendingRecord || saving) return;
+      saving = true;
+      el('saveStatus').textContent = '履歴：LOG・判定履歴へ保存中…';
+      updateSaveControls();
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 45000);
+      try {
+        if (!logApiReady) throw new Error('Apps Scriptを履歴保存対応版へ更新し、ページを開き直してください。');
+        const response = await fetch(GAS_API_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+          body: JSON.stringify(pendingRecord),
+          signal: controller.signal,
+          redirect: 'follow'
+        });
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        let result;
+        try { result = await response.json(); }
+        catch (_) { throw new Error('保存結果を確認できません。Apps Scriptの公開設定を確認してください。'); }
+        if (result.status !== 'success' || result.saveId !== pendingRecord.saveId || !Array.isArray(result.savedSheets) || result.savedSheets.length !== 2) {
+          throw new Error(result.message || '2枚のシートへの保存を確認できません。');
+        }
+        el('saveStatus').textContent = '履歴：' + result.savedSheets.join('・') + 'へ保存済み';
+        pendingRecord = null;
+      } catch (error) {
+        const message = error.name === 'AbortError' ? '保存の確認が時間切れになりました。' : error.message;
+        el('saveStatus').textContent = '履歴：保存未確認。' + message + ' 「履歴の保存を再試行する」を押してください。';
+      } finally {
+        clearTimeout(timeout);
+        saving = false;
+        updateSaveControls();
+      }
+    }
+    el('saveRetryBtn').addEventListener('click', savePendingRecord);
+    window.addEventListener('beforeunload', event => {
+      if (pendingRecord) { event.preventDefault(); event.returnValue = ''; }
+    });
     function status(message) { el('status').textContent = message; }
     function selectedPackage() {
       return masterData.find(item => String(item.packageId) === el('packageSelect').value);
@@ -159,10 +208,13 @@
       el('previewB').removeAttribute('src');
       el('textAVal').textContent = '未読取';
       el('textBVal').textContent = '未読取';
+      el('saveStatus').textContent = '履歴：判定後に保存します';
       setResult('未判定');
+      let logContext = null;
       try {
         const pkg = selectedPackage();
         if (!pkg) throw new Error('パッケージが選択されていません。');
+        if (!logApiReady) throw new Error('Apps Scriptが履歴保存対応版になっていません。先にApps Scriptを更新してください。');
         if (video.readyState < 2 || video.videoWidth < 1 || video.videoHeight < 1) {
           throw new Error('映像の準備ができていません。もう一度撮影してください。');
         }
@@ -173,6 +225,7 @@
         frame.getContext('2d').drawImage(video, 0, 0);
         const imageA = cropToCanvasBase64(frame, pkg.a, 'A');
         const imageB = cropToCanvasBase64(frame, pkg.b, 'B');
+        logContext = { action: 'saveResult', saveId: crypto.randomUUID(), packageId: String(pkg.packageId), textA: '', textB: '', errorMessage: '' };
         el('previewA').src = imageA;
         el('previewB').src = imageB;
         // フレーム保存・切り抜き後にカメラを停止する。
@@ -192,8 +245,10 @@
           return result.data.text.trim();
         };
         const textA = await recognize(imageA, 'A');
+        logContext.textA = textA;
         el('textAVal').textContent = textA || '（文字未検出）';
         const textB = await recognize(imageB, 'B');
+        logContext.textB = textB;
         el('textBVal').textContent = textB || '（文字未検出）';
         if (!textA || !textB) {
           setResult('読取不可');
@@ -203,16 +258,26 @@
           setResult(same ? 'OK' : 'NG', same ? 'ok' : 'ng');
           status(same ? 'A・Bの認識文字が一致しました。' : 'A・Bの認識文字が異なります。表示された文字を確認してください。');
         }
+        pendingRecord = logContext;
+        await savePendingRecord();
       } catch (error) {
         setResult('処理エラー');
         el('resultArea').hidden = false;
         status('処理エラー：' + error.message);
+        if (logContext) {
+          logContext.errorMessage = error.message;
+          pendingRecord = logContext;
+          await savePendingRecord();
+        } else {
+          el('saveStatus').textContent = '履歴：撮影前に中断したため保存していません。';
+        }
       } finally {
         busy = false;
         el('packageSelect').disabled = false;
         el('languageSelect').disabled = false;
         el('retryBtn').disabled = false;
         el('captureBtn').disabled = !mediaStream;
+        updateSaveControls();
       }
     });
     el('retryBtn').addEventListener('click', async () => {
@@ -231,10 +296,11 @@
           throw new Error(result.message || 'マスターの応答形式が正しくありません。');
         }
         masterData = result.data;
+        logApiReady = result.logApiVersion === 1;
         el('packageSelect').replaceChildren(new Option('-- パッケージを選択してください --', ''));
         masterData.forEach(item => el('packageSelect').appendChild(new Option(item.packageId + ': ' + item.packageName, String(item.packageId))));
         el('packageSelect').disabled = false;
-        status(masterData.length ? 'パッケージを選択してください。' : 'マスターが0件です。Masterシートを確認してください。');
+        status(!logApiReady ? '先にApps Scriptを履歴保存対応版へ更新してください。更新後、このページを開き直してください。' : masterData.length ? 'パッケージを選択してください。' : 'マスターが0件です。Masterシートを確認してください。');
       } catch (error) {
         el('packageSelect').replaceChildren(new Option('マスター取得失敗', ''));
         status('マスター取得エラー：' + error.message + '\n通信環境とApps Scriptの公開設定を確認してください。');
