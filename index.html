@@ -38,7 +38,7 @@
     <select id="languageSelect">
       <option value="eng">英字2文字＋数字2桁（例：AD80・BC12）</option>
     </select>
-    <small>自動分割・再解析対応版。4方向で見つからないときは、画像を内部で分割して読み直します。全角・小文字は半角大文字にそろえます。Oと0などは自動で置き換えません。</small>
+    <small>無料・連写選択版 2026-11-24。約1秒間、スマホを動かさず撮影してください。5枚からA・Bがより鮮明な1枚を選び、自動分割して認識します。</small>
     <p id="status" role="status" aria-live="polite">マスターを読み込んでいます。</p>
   </div>
   <div class="card" id="cameraCard" hidden>
@@ -54,8 +54,8 @@
     <h2>判定結果</h2>
     <p id="analysisStatus" role="status" aria-live="polite"></p>
     <div class="previews">
-      <div><p>Aの切り抜き画像</p><img id="previewA" alt="A位置の切り抜き画像"></div>
-      <div><p>Bの切り抜き画像</p><img id="previewB" alt="B位置の切り抜き画像"></div>
+      <div><p>Aの切り抜き画像</p><img id="previewA" alt="A位置の切り抜き画像"><small id="imageSizeA"></small><a id="downloadA" download="A-crop.png" hidden>A画像を保存</a></div>
+      <div><p>Bの切り抜き画像</p><img id="previewB" alt="B位置の切り抜き画像"><small id="imageSizeB"></small><a id="downloadB" download="B-crop.png" hidden>B画像を保存</a></div>
     </div>
     <p>A位置のコード：<span id="textAVal" class="ocr-text">-</span></p>
     <p>B位置のコード：<span id="textBVal" class="ocr-text">-</span></p>
@@ -431,6 +431,51 @@
       canvas.getContext('2d').drawImage(source, x, y, w, h, 0, 0, w, h);
       return canvas;
     }
+    function laplacianVariance(gray, width, height) {
+      let sum=0, squares=0, count=0;
+      for(let y=1;y<height-1;y++)for(let x=1;x<width-1;x++) {
+        const i=y*width+x;
+        const value=gray[i-1]+gray[i+1]+gray[i-width]+gray[i+width]-4*gray[i];
+        sum+=value;squares+=value*value;count++;
+      }
+      return count?Math.max(0,squares/count-(sum/count)**2):0;
+    }
+    function regionSharpness(frame, area) {
+      const canvas=document.createElement('canvas');
+      canvas.width=160;
+      canvas.height=Math.max(3,Math.min(160,Math.round(160*frame.height*area.h/(frame.width*area.w))));
+      const context=canvas.getContext('2d',{willReadFrequently:true});
+      context.drawImage(frame,frame.width*area.x/100,frame.height*area.y/100,frame.width*area.w/100,frame.height*area.h/100,0,0,canvas.width,canvas.height);
+      const pixels=context.getImageData(0,0,canvas.width,canvas.height).data;
+      const gray=new Float32Array(canvas.width*canvas.height);
+      for(let i=0;i<gray.length;i++)gray[i]=pixels[i*4]*.299+pixels[i*4+1]*.587+pixels[i*4+2]*.114;
+      return laplacianVariance(gray,canvas.width,canvas.height);
+    }
+    function combinedSharpness(a,b) {
+      // 片方だけが鮮明な写真より、両方が写っている写真を優先する。
+      return 2/(1/(a+1)+1/(b+1));
+    }
+    async function captureBestFrame(pkg) {
+      const a=validateArea(pkg.a,'A'),b=validateArea(pkg.b,'B');
+      const generation=cameraGeneration;
+      let best=null,bestScore=-1;
+      // ボタンを触った瞬間の揺れが収まる時間を取る。
+      await new Promise(resolve=>setTimeout(resolve,200));
+      for(let index=0;index<5;index++) {
+        if(generation!==cameraGeneration || !mediaStream || video.readyState<2 || !video.videoWidth || !video.videoHeight) throw new Error('撮影中に映像が停止しました。もう一度撮影してください。');
+        status('連写中（'+(index+1)+'/5）。約1秒間、スマホを動かさずお待ちください。');
+        const frame=document.createElement('canvas');
+        frame.width=video.videoWidth;frame.height=video.videoHeight;
+        frame.getContext('2d').drawImage(video,0,0);
+        const score=combinedSharpness(regionSharpness(frame,a),regionSharpness(frame,b));
+        if(score>bestScore) {
+          if(best){best.width=1;best.height=1;}
+          best=frame;bestScore=score;
+        }else{frame.width=1;frame.height=1;}
+        if(index<4)await new Promise(resolve=>setTimeout(resolve,160));
+      }
+      return best;
+    }
     function setResult(text, className = 'pending') {
       el('finalResult').textContent = text;
       el('finalResult').className = className;
@@ -445,12 +490,14 @@
       if (busy) return;
       busy = true;
       el('captureBtn').disabled = true;
+      el('captureBtn').textContent = '撮影中…動かさずお待ちください';
       el('packageSelect').disabled = true;
       el('languageSelect').disabled = true;
       el('retryBtn').disabled = true;
       el('resultArea').hidden = true;
       el('previewA').removeAttribute('src');
       el('previewB').removeAttribute('src');
+      for (const label of ['A','B']) { el('download'+label).hidden = true; el('imageSize'+label).textContent = ''; }
       el('textAVal').textContent = '未読取';
       el('textBVal').textContent = '未読取';
       el('detailA').textContent = '';
@@ -466,16 +513,18 @@
         if (video.readyState < 2 || video.videoWidth < 1 || video.videoHeight < 1) {
           throw new Error('映像の準備ができていません。もう一度撮影してください。');
         }
-        // 映像が動いている間に、同じ1フレームを保存する。
-        const frame = document.createElement('canvas');
-        frame.width = video.videoWidth;
-        frame.height = video.videoHeight;
-        frame.getContext('2d').drawImage(video, 0, 0);
+        // 同じフレームに写るA・Bを評価し、連写の中から1枚を選ぶ。
+        const frame = await captureBestFrame(pkg);
         const imageA = cropToCanvasBase64(frame, pkg.a, 'A');
         const imageB = cropToCanvasBase64(frame, pkg.b, 'B');
         logContext = { action: 'saveResult', recognitionMode: 'code-2letters-2digits-v1', saveId: crypto.randomUUID(), packageId: String(pkg.packageId), textA: '', textB: '', candidatesA: [], candidatesB: [], confidenceA: 0, confidenceB: 0, rawTextA: '', rawTextB: '', errorMessage: '' };
         el('previewA').src = imageA.toDataURL('image/png');
         el('previewB').src = imageB.toDataURL('image/png');
+        for (const [label, image] of [['A',imageA],['B',imageB]]) {
+          el('imageSize'+label).textContent = image.width + ' × ' + image.height + ' px';
+          el('download'+label).href = el('preview'+label).src;
+          el('download'+label).hidden = false;
+        }
         // フレーム保存・切り抜き後にカメラを停止する。
         stopCamera();
         el('cameraCard').hidden = true;
@@ -514,6 +563,7 @@
         el('languageSelect').disabled = false;
         el('retryBtn').disabled = false;
         el('captureBtn').disabled = !mediaStream;
+        el('captureBtn').textContent = 'この位置で撮影・判定する';
         updateSaveControls();
       }
     });
