@@ -40,7 +40,7 @@
     </select>
     <label for="captureMode">撮影画質</label>
     <select id="captureMode"><option value="photo">高画質静止画を優先（対応端末）</option><option value="video">従来の連写</option></select>
-    <small>無料・文字候補再認識V6。撮影中はスマホを動かさずお待ちください。対応端末では、カメラの静止画を使って文字を読み取ります。</small>
+    <small>無料・文字候補再認識V6.1。撮影中はスマホを動かさずお待ちください。対応端末では、カメラの静止画を使って文字を読み取ります。</small>
     <p id="status" role="status" aria-live="polite">マスターを読み込んでいます。</p>
   </div>
   <div class="card" id="cameraCard" hidden>
@@ -64,6 +64,7 @@
     <p>A位置のコード：<span id="textAVal" class="ocr-text">-</span></p>
     <p>B位置のコード：<span id="textBVal" class="ocr-text">-</span></p>
     <details><summary>読み取りの詳細</summary><p id="detailA" class="ocr-text"></p><p id="detailB" class="ocr-text"></p></details>
+    <p><a id="downloadReport" href="#" download="recognition-details.txt" onclick="prepareRecognitionReport()">読み取りの詳細をファイルで保存</a></p>
     <p>判定：<span id="finalResult" class="pending">未判定</span></p>
     <p id="saveStatus" role="status" aria-live="polite">履歴：未保存</p>
     <button id="saveRetryBtn" hidden>履歴の保存を再試行する</button>
@@ -81,6 +82,25 @@
     let pendingRecord = null;
     let saving = false;
     let cameraPhotoUrl = null;
+    function prepareRecognitionReport() {
+      const pkg=selectedPackage();
+      const report=[
+        'パッケージ照合アプリ V6.1 読み取り詳細',
+        '保存日時：'+new Date().toISOString(),
+        'パッケージ：'+(pkg?String(pkg.packageId)+' '+String(pkg.packageName):'未選択'),
+        'マスク座標：'+(pkg?JSON.stringify({a:pkg.a,b:pkg.b}):'なし'),
+        el('captureInfo').textContent,
+        'A画像サイズ：'+el('imageSizeA').textContent,
+        'B画像サイズ：'+el('imageSizeB').textContent,
+        'Aコード：'+el('textAVal').textContent,
+        'Bコード：'+el('textBVal').textContent,
+        '判定：'+el('finalResult').textContent,
+        el('status').textContent,
+        el('saveStatus').textContent,
+        '',el('detailA').textContent,'',el('detailB').textContent
+      ].join('\n');
+      el('downloadReport').href='data:text/plain;charset=utf-8,'+encodeURIComponent('\uFEFF'+report);
+    }
     function clearPhotoDiagnostics() {
       if(cameraPhotoUrl&&typeof URL!=='undefined')URL.revokeObjectURL(cameraPhotoUrl);
       cameraPhotoUrl=null;
