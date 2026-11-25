@@ -40,7 +40,7 @@
     </select>
     <label for="captureMode">撮影画質</label>
     <select id="captureMode"><option value="photo">高画質静止画を優先（対応端末）</option><option value="video">従来の連写</option></select>
-    <small>無料・文字候補再認識V6.1。撮影中はスマホを動かさずお待ちください。対応端末では、カメラの静止画を使って文字を読み取ります。</small>
+    <small>無料・文字候補確認V6.2。撮影中はスマホを動かさずお待ちください。対応端末では、カメラの静止画を使って文字を読み取ります。</small>
     <p id="status" role="status" aria-live="polite">マスターを読み込んでいます。</p>
   </div>
   <div class="card" id="cameraCard" hidden>
@@ -85,7 +85,7 @@
     function prepareRecognitionReport() {
       const pkg=selectedPackage();
       const report=[
-        'パッケージ照合アプリ V6.1 読み取り詳細',
+        'パッケージ照合アプリ V6.2 読み取り詳細',
         '保存日時：'+new Date().toISOString(),
         'パッケージ：'+(pkg?String(pkg.packageId)+' '+String(pkg.packageName):'未選択'),
         'マスク座標：'+(pkg?JSON.stringify({a:pkg.a,b:pkg.b}):'なし'),
@@ -177,13 +177,21 @@
     }
     function summarizeCodePasses(passes) {
       const candidates = new Map();
-      for (const pass of passes) for (const candidate of pass.candidates) {
+      const accepted=passes.flatMap(pass=>pass.candidates).filter(item=>item.confidence>=MIN_CODE_CONFIDENCE);
+      const nearAccepted=code=>accepted.some(item=>Array.from(code).filter((letter,index)=>letter!==item.code[index]).length<=1);
+      // 境界だけの候補は確定しない。確定候補と1文字違う場合は誤読の疑いを残す。
+      for (const pass of passes) for (const candidate of [...pass.candidates,...(pass.rejected||[]).filter(item=>item.confidence>=MIN_CODE_CONFIDENCE&&(!accepted.length||nearAccepted(item.code))).map(item=>({...item,confidence:0}))]) {
         const previous = candidates.get(candidate.code);
         if (!previous || candidate.confidence > previous.confidence) candidates.set(candidate.code, { ...candidate, angle: pass.angle });
       }
       const list = Array.from(candidates.values()).sort((a, b) => b.confidence - a.confidence);
       const state = list.length > 1 ? 'ambiguous' : !list.length ? 'missing' : list[0].confidence < MIN_CODE_CONFIDENCE ? 'uncertain' : 'read';
-      return { state, code: state === 'read' ? list[0].code : '', candidates: list.map(item => item.code), confidence: list[0]?.confidence || 0, angle: list[0]?.angle || 0, rawText: passes.map(pass => '[' + pass.angle + '度' + (pass.region ? '・' + pass.region : '') + ']\n' + pass.text).join('\n').slice(0, 10000) };
+      const evidence=passes.flatMap(pass=>[
+        ...pass.candidates.map(item=>'['+pass.angle+'度・'+(pass.region||'')+'] 候補 '+item.code+'／確信度 '+item.confidence.toFixed(1)),
+        ...(pass.rejected||[]).map(item=>'['+pass.angle+'度・'+(pass.region||'')+'] 境界のため保留 '+item.code+'／確信度 '+item.confidence.toFixed(1))
+      ]);
+      const rawText=['候補の確認結果',...(evidence.length?evidence:['候補なし']),'','読み取り原文',...passes.map(pass=>'['+pass.angle+'度'+(pass.region?'・'+pass.region:'')+']\n'+pass.text)].join('\n').slice(0,10000);
+      return { state, code: state === 'read' ? list[0].code : '', candidates: list.map(item => item.code), confidence: list[0]?.confidence || 0, angle: list[0]?.angle || 0, rawText };
     }
     function judgeCodeResults(a, b) {
       if ([a.state, b.state].some(state => state === 'ambiguous' || state === 'uncertain')) return '要確認';
@@ -237,7 +245,7 @@
         const text=normalizeCodeText(word.text).replace(/[^A-Z0-9]/g,'');
         // 形式の近い文字を再撮影画像から読み直す。文字の置換で正解を作らない。
         const b=word.bbox;
-        return /^[A-Z]{2}[A-Z0-9]{2}$/.test(text)&&!codeMatches(word.text).length&&b&&b.x0>22&&b.x1<tile.width-22&&b.y0>=20&&b.y1<=tile.height-20;
+        return /^[A-Z]{2}[A-Z0-9]{2}$/.test(text)&&b&&b.x0>22&&b.x1<tile.width-22&&b.y0>=20&&b.y1<=tile.height-20&&(!codeMatches(word.text).length||!completeTileCandidate(word,tile));
       });
     }
     function makeWordImage(source,b) {
@@ -275,7 +283,8 @@
             status(label+'を自動切り分けして再解析中（'+(++attempts)+'/336）。');
             const tile=makeRecognitionTile(image,left,top,binary?.3:.18);
             const {data}=await worker.recognize(tile);
-            passes.push({angle,region:'自動切り分け・'+(binary?'白黒':'グレー')+' '+left+','+top,text:data.text||'',candidates:candidatesFromOcr(data).filter(candidate=>completeTileCandidate(candidate,tile))});
+            const detected=candidatesFromOcr(data);
+            passes.push({angle,region:'自動切り分け・'+(binary?'白黒':'グレー')+' '+left+','+top,text:data.text||'',candidates:detected.filter(candidate=>completeTileCandidate(candidate,tile)),rejected:detected.filter(candidate=>!completeTileCandidate(candidate,tile))});
             if(!binary&&rereads<24)for(const word of codeWordRegions(data,tile)) {
               if(rereads++>=24)break;
               await worker.setParameters({tessedit_pageseg_mode:Tesseract.PSM.SINGLE_WORD});
