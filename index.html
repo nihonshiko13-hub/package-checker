@@ -38,7 +38,7 @@
     <select id="languageSelect">
       <option value="eng">英字2文字＋数字2桁（例：AD80・BC12）</option>
     </select>
-    <small>無料・連写選択版 2026-11-24。約1秒間、スマホを動かさず撮影してください。5枚からA・Bがより鮮明な1枚を選び、自動分割して認識します。</small>
+    <small>無料・傾き補正V3。約1秒間、スマホを動かさず撮影してください。連写で選んだ画像を傾き補正し、コード4文字だけを評価します。</small>
     <p id="status" role="status" aria-live="polite">マスターを読み込んでいます。</p>
   </div>
   <div class="card" id="cameraCard" hidden>
@@ -90,7 +90,13 @@
         code: match[1] + match[2] + match[3] + match[4],
         start: match.index + (/^[A-Z0-9]/.test(match[0]) ? 0 : 1),
         end: match.index + match[0].length
-      }));
+      })).filter(match=>{
+        let left=match.start,right=match.end;
+        while(left>0&&!/\s/.test(normalized[left-1]))left--;
+        while(right<normalized.length&&!/\s/.test(normalized[right]))right++;
+        // 番号の途中の記号を区切りと誤認し、先頭4文字だけを採用しない。
+        return normalized.slice(left,right).replace(/[^A-Z0-9]/g,'')===match.code;
+      });
     }
     function candidatesFromOcr(data) {
       // 同じ行の単語だけを結合し、離れた行から4文字を作らない。
@@ -99,7 +105,7 @@
       for (const line of lines) {
         const words = line.words || [];
         if (!words.length) {
-          for (const match of codeMatches(line.text)) found.push({ code: match.code, confidence: ocrConfidence(line.confidence) });
+          for (const match of codeMatches(line.text)) found.push({ code: match.code, confidence: ocrConfidence(line.confidence), bbox:line.bbox });
           continue;
         }
         let text = '';
@@ -107,12 +113,25 @@
         for (const word of words) {
           if (text) text += ' ';
           const start = text.length;
-          text += normalizeCodeText(word.text);
-          spans.push({ start, end: text.length, confidence: ocrConfidence(word.confidence) });
+          const wordText=normalizeCodeText(word.text);
+          text += wordText;
+          const symbols=word.symbols||[];
+          if(symbols.length && symbols.map(symbol=>normalizeCodeText(symbol.text)).join('')===wordText) {
+            let offset=start;
+            for(const symbol of symbols) {
+              const value=normalizeCodeText(symbol.text);
+              if(/[A-Z0-9]/.test(value))spans.push({start:offset,end:offset+value.length,confidence:ocrConfidence(symbol.confidence),bbox:symbol.bbox});
+              offset+=value.length;
+            }
+          }else{
+            spans.push({ start, end: text.length, confidence: ocrConfidence(word.confidence),bbox:word.bbox });
+          }
         }
         for (const match of codeMatches(text)) {
           const overlaps = spans.filter(span => span.start < match.end && span.end > match.start);
-          found.push({ code: match.code, confidence: overlaps.length ? Math.min(...overlaps.map(span => span.confidence)) : 0 });
+          const boxes=overlaps.map(span=>span.bbox).filter(box=>box&&['x0','x1','y0','y1'].every(key=>Number.isFinite(box[key])));
+          const bbox=boxes.length===overlaps.length&&boxes.length?{x0:Math.min(...boxes.map(b=>b.x0)),y0:Math.min(...boxes.map(b=>b.y0)),x1:Math.max(...boxes.map(b=>b.x1)),y1:Math.max(...boxes.map(b=>b.y1))}:undefined;
+          found.push({ code: match.code, confidence: overlaps.length ? Math.min(...overlaps.map(span => span.confidence)) : 0,bbox });
         }
       }
       return found;
@@ -132,181 +151,85 @@
       if (a.state !== 'read' || b.state !== 'read') return '読取不可';
       return a.code === b.code ? 'OK' : 'NG';
     }
-    function rotateForOcr(source, angle) {
-      const sideways = angle === 90 || angle === 270;
-      const scale = Math.min(2, 2000 / Math.max(source.width, source.height));
-      const width = Math.max(1, Math.round(source.width * scale));
-      const height = Math.max(1, Math.round(source.height * scale));
-      const margin = 20;
-      const canvas = document.createElement('canvas');
-      canvas.width = (sideways ? height : width) + margin * 2;
-      canvas.height = (sideways ? width : height) + margin * 2;
-      const context = canvas.getContext('2d');
-      context.fillStyle = 'white';
-      context.fillRect(0, 0, canvas.width, canvas.height);
-      context.translate(canvas.width / 2, canvas.height / 2);
-      context.rotate(angle * Math.PI / 180);
-      context.drawImage(source, -width / 2, -height / 2, width, height);
+    function makeRecognitionImage(source, angle, binary = false) {
+      const radians=angle*Math.PI/180;
+      const scale=Math.min(3,1800/Math.max(source.width,source.height));
+      const w=source.width*scale,h=source.height*scale;
+      const canvas=document.createElement('canvas');
+      canvas.width=Math.ceil(Math.abs(w*Math.cos(radians))+Math.abs(h*Math.sin(radians)))+40;
+      canvas.height=Math.ceil(Math.abs(h*Math.cos(radians))+Math.abs(w*Math.sin(radians)))+40;
+      const context=canvas.getContext('2d',{willReadFrequently:true});
+      context.fillStyle='white';context.fillRect(0,0,canvas.width,canvas.height);
+      context.translate(canvas.width/2,canvas.height/2);context.rotate(radians);
+      context.drawImage(source,-w/2,-h/2,w,h);
+      const pixels=context.getImageData(0,0,canvas.width,canvas.height);
+      for(let i=0;i<pixels.data.length;i+=4) {
+        let gray=pixels.data[i]*.299+pixels.data[i+1]*.587+pixels.data[i+2]*.114;
+        if(binary)gray=gray<150?0:255;
+        pixels.data[i]=pixels.data[i+1]=pixels.data[i+2]=gray;
+      }
+      context.putImageData(pixels,0,0);
       return canvas;
     }
-    function makeOcrBand(source, position) {
-      const height = Math.max(1, Math.round(source.height * 0.45));
-      const y = Math.round((source.height - height) * position);
-      const scale = Math.min(1.5, 1800 / source.width);
-      const canvas = document.createElement('canvas');
-      const margin = 20;
-      const width = Math.max(1, Math.round(source.width * scale));
-      const scaledHeight = Math.max(1, Math.round(height * scale));
-      canvas.width = width + margin * 2;
-      canvas.height = scaledHeight + margin * 2;
-      const context = canvas.getContext('2d', { willReadFrequently: true });
-      context.fillStyle = 'white';
-      context.fillRect(0, 0, canvas.width, canvas.height);
-      context.drawImage(source, 0, y, source.width, height, margin, margin, width, scaledHeight);
-      // 周囲の色を除き、黒い印字と白いラベルの差を広げる。
-      const image = context.getImageData(margin, margin, width, scaledHeight);
-      const histogram = new Uint32Array(256);
-      for (let i = 0; i < image.data.length; i += 4) {
-        const gray = Math.round(image.data[i] * 0.299 + image.data[i + 1] * 0.587 + image.data[i + 2] * 0.114);
-        image.data[i] = gray;
-        histogram[gray]++;
-      }
-      const tail = width * scaledHeight * 0.01;
-      let low = 0, high = 255, count = 0;
-      while (low < 255 && (count += histogram[low]) <= tail) low++;
-      count = 0;
-      while (high > low && (count += histogram[high]) <= tail) high--;
-      for (let i = 0; i < image.data.length; i += 4) {
-        const value = high > low ? Math.max(0, Math.min(255, Math.round((image.data[i] - low) * 255 / (high - low)))) : image.data[i];
-        image.data[i] = image.data[i + 1] = image.data[i + 2] = value;
-      }
-      context.putImageData(image, margin, margin);
+    function makeRecognitionTile(source,left,top) {
+      const canvas=document.createElement('canvas');
+      canvas.width=Math.round(source.width*.75)+40;
+      canvas.height=Math.round(source.height*.3)+40;
+      const context=canvas.getContext('2d');
+      context.fillStyle='white';context.fillRect(0,0,canvas.width,canvas.height);
+      context.drawImage(source,source.width*left,source.height*top,source.width*.75,source.height*.3,20,20,canvas.width-40,canvas.height-40);
       return canvas;
     }
-    function findCharacterRegions(source) {
-      const context = source.getContext('2d', { willReadFrequently: true });
-      const { width, height } = source;
-      const pixels = context.getImageData(0, 0, width, height).data;
-      const dark = new Uint8Array(width * height);
-      for (let i = 0; i < dark.length; i++) dark[i] = pixels[i * 4] * .299 + pixels[i * 4 + 1] * .587 + pixels[i * 4 + 2] * .114 < 110 ? 1 : 0;
-      const queue = new Int32Array(width * height);
-      const boxes = [];
-      for (let start = 0; start < dark.length; start++) {
-        if (!dark[start]) continue;
-        let head = 0, tail = 1, count = 0;
-        queue[0] = start;
-        dark[start] = 0;
-        let x0 = width, y0 = height, x1 = 0, y1 = 0;
-        while (head < tail) {
-          const index = queue[head++], x = index % width, y = Math.floor(index / width);
-          count++; x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y);
-          for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
-            const nx = x + dx, ny = y + dy;
-            if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
-            const neighbor = ny * width + nx;
-            if (dark[neighbor]) { dark[neighbor] = 0; queue[tail++] = neighbor; }
-          }
+    function orientationScore(data) {
+      return (data.words||[]).reduce((sum,word)=>{
+        const count=(normalizeCodeText(word.text).match(/[A-Z0-9]/g)||[]).length;
+        return count>=3?sum+ocrConfidence(word.confidence)*Math.min(count,12):sum;
+      },0);
+    }
+    function completeTileCandidate(candidate,tile) {
+      const b=candidate.bbox;
+      // タイルの端で切れた長い品番を、4文字コードとして採用しない。
+      return !!b&&b.x0>22&&b.y0>22&&b.x1<tile.width-22&&b.y1<tile.height-22;
+    }
+    async function recognizeCode(worker,source,label) {
+      const passes=[],orientations=[];
+      await worker.setParameters({tessedit_pageseg_mode:Tesseract.PSM.SPARSE_TEXT,tessedit_char_whitelist:''});
+      for(const base of [0,90,180,270]) {
+        let bestScore=0;
+        for(const offset of [0,-4,4]) {
+          const angle=(base+offset+360)%360;
+          status(label+'のコードを解析中（'+angle+'度・傾き補正）。');
+          const {data}=await worker.recognize(makeRecognitionImage(source,angle));
+          passes.push({angle,region:'傾き補正・グレー',text:data.text||'',candidates:candidatesFromOcr(data)});
+          bestScore=Math.max(bestScore,orientationScore(data));
         }
-        const w = x1 - x0 + 1, h = y1 - y0 + 1;
-        if (count >= 12 && h >= 12 && h <= height * .5 && w >= 3 && w / h >= .12 && w / h <= 1.3) boxes.push({ x:x0, y:y0, w, h });
+        orientations.push({base,score:bestScore});
       }
-      const regions = [];
-      const keys = new Set();
-      for (const anchor of boxes) {
-        const line = boxes.filter(box => box.h >= anchor.h * .65 && box.h <= anchor.h * 1.55 && Math.abs((box.y + box.h / 2) - (anchor.y + anchor.h / 2)) <= anchor.h * .3).sort((a,b) => a.x - b.x);
-        for (let i = 0; i + 3 < line.length; i++) {
-          const chars = line.slice(i, i + 4);
-          const h = Math.max(...chars.map(c=>c.h));
-          if (chars.slice(1).some((c,j) => c.x - (chars[j].x + chars[j].w) > h * .7)) continue;
-          // 長い印字の先頭4文字を切って、別コードを作らない。
-          if (i > 0 && chars[0].x - (line[i-1].x + line[i-1].w) <= h * .7) continue;
-          if (i+4 < line.length && line[i+4].x - (chars[3].x + chars[3].w) <= h * .7) continue;
-          const x = chars[0].x, y = Math.min(...chars.map(c=>c.y));
-          const w = chars[3].x + chars[3].w - x;
-          const bottom = Math.max(...chars.map(c=>c.y+c.h));
-          if (w / (bottom-y) < 1.1 || w / (bottom-y) > 4.8) continue;
-          const key = [x,y,w,bottom-y].join(',');
-          if (keys.has(key)) continue;
-          keys.add(key);
-          regions.push({x,y,w,h:bottom-y, chars, score:chars.reduce((sum,c)=>sum+Math.abs(c.h-h),0)/h});
-        }
-      }
-      return regions.sort((a,b)=>a.score-b.score).slice(0,10);
-    }
-    function prepareCharacterRegion(source, region, singleCharacter = false) {
-      const padding = singleCharacter ? Math.max(2, Math.round(region.h * .04)) : Math.max(4, Math.round(region.h * .15));
-      const x = Math.max(0, region.x - padding), y = Math.max(0, region.y - padding);
-      const width = Math.min(source.width - x, region.w + padding * 2);
-      const height = Math.min(source.height - y, region.h + padding * 2);
-      const scale = Math.min(3, 120 / region.h);
-      const canvas = document.createElement('canvas');
-      canvas.width = Math.round(width * scale) + 40;
-      canvas.height = Math.round(height * scale) + 40;
-      const context = canvas.getContext('2d');
-      context.fillStyle = 'white';
-      context.fillRect(0,0,canvas.width,canvas.height);
-      context.drawImage(source,x,y,width,height,20,20,width*scale,height*scale);
-      return canvas;
-    }
-    async function recognizeCode(worker, source, label) {
-      const passes = [];
-      await worker.setParameters({ tessedit_pageseg_mode: Tesseract.PSM.SPARSE_TEXT });
-      // 一つ候補が見つかっても全方向を確認し、別の候補を見落とさない。
-      for (const angle of [0, 90, 180, 270]) {
-        status(label + 'のコードを解析中（' + angle + '度／4方向）。');
-        const { data } = await worker.recognize(rotateForOcr(source, angle));
-        passes.push({ angle, text: data.text || '', candidates: candidatesFromOcr(data) });
-      }
-      const initial = summarizeCodePasses(passes);
-      if (initial.state !== 'missing' && initial.state !== 'uncertain') return initial;
-      // マスターの枠は変更せず、同じ静止画の上・中央・下を重ねて探索する。
-      // 各帯を1行として認識し、バーコード等と別行の印字を分ける。
+      const initial=summarizeCodePasses(passes);
+      if(initial.state==='read'||initial.state==='ambiguous')return initial;
+      orientations.sort((a,b)=>b.score-a.score);
+      let attempts=0;
       try {
-        await worker.setParameters({ tessedit_pageseg_mode: Tesseract.PSM.SINGLE_LINE });
-        for (const angle of [0,90,180,270]) {
-          const rotated = rotateForOcr(source,angle);
-          const regions = findCharacterRegions(rotated);
-          for (let index=0; index<regions.length; index++) {
-            status(label + 'の文字のまとまりを再解析中（' + angle + '度・' + (index+1) + '/' + regions.length + '）。');
-            const { data } = await worker.recognize(prepareCharacterRegion(rotated,regions[index]));
-            passes.push({angle,region:'文字領域'+(index+1),text:data.text||'',candidates:candidatesFromOcr(data)});
-            const raw = normalizeCodeText(data.text).replace(/[^A-Z0-9]/g,'');
-            if (!codeMatches(data.text).length && /^[A-Z]{2}[A-Z0-9]{2,3}$/.test(raw) && /[0-9]/.test(raw)) {
-              // 対象形式に合わせ、先頭2文字と末尾2数字を画像から別々に再認識する。
-              // A側の結果をB側の正解として利用しない。
-              let code = '', confidence = 100;
-              try {
-                for (let c=0;c<4;c++) {
-                  await worker.setParameters({tessedit_pageseg_mode:Tesseract.PSM.SINGLE_CHAR,tessedit_char_whitelist:c<2?'ABCDEFGHIJKLMNOPQRSTUVWXYZ':'0123456789'});
-                  const glyph = await worker.recognize(prepareCharacterRegion(rotated,regions[index].chars[c],true));
-                  const text = normalizeCodeText(glyph.data.text).trim();
-                  if (!(c<2?/^[A-Z]$/:/^[0-9]$/).test(text)) { code=''; break; }
-                  code += text;
-                  confidence = Math.min(confidence,ocrConfidence(glyph.data.confidence));
-                }
-              } finally {
-                await worker.setParameters({tessedit_pageseg_mode:Tesseract.PSM.SINGLE_LINE,tessedit_char_whitelist:''});
-              }
-              passes.push({angle,region:'文字領域'+(index+1)+'・位置別再認識',text:code||'文字を確定できませんでした',candidates:code?[{code,confidence}]:[]});
-            }
+        await worker.setParameters({tessedit_pageseg_mode:Tesseract.PSM.SINGLE_LINE});
+        for(const {base} of orientations)for(const offset of [0,4,-4]) {
+          const angle=(base+offset+360)%360;
+          const image=makeRecognitionImage(source,angle,true);
+          for(const left of [.25,0])for(const top of [.35,.175,.525,0,.7]) {
+            status(label+'を自動切り分けして再解析中（'+(++attempts)+'/120）。');
+            const tile=makeRecognitionTile(image,left,top);
+            const {data}=await worker.recognize(tile);
+            passes.push({angle,region:'自動切り分け・白黒 '+left+','+top,text:data.text||'',candidates:candidatesFromOcr(data).filter(candidate=>completeTileCandidate(candidate,tile))});
           }
+          // 同じ角度の各領域を確認してから判定する。別候補は要確認へ回す。
+          const result=summarizeCodePasses(passes);
+          if(result.state==='read'||result.state==='ambiguous')return result;
         }
-        const grouped = summarizeCodePasses(passes);
-        if (grouped.state !== 'missing' && grouped.state !== 'uncertain') return grouped;
-        let completed = 0;
-        for (const angle of [0, 90, 180, 270]) {
-          const rotated = rotateForOcr(source, angle);
-          for (const [position, name] of [[0, '上部'], [0.5, '中央'], [1, '下部']]) {
-            status(label + 'を自動分割して再解析中（' + (++completed) + '/12）。撮り直しは不要です。');
-            const { data } = await worker.recognize(makeOcrBand(rotated, position));
-            passes.push({ angle, region: name + '・再解析', text: data.text || '', candidates: candidatesFromOcr(data) });
-          }
-        }
-      } finally {
-        await worker.setParameters({ tessedit_pageseg_mode: Tesseract.PSM.SPARSE_TEXT });
+      }finally{
+        await worker.setParameters({tessedit_pageseg_mode:Tesseract.PSM.SPARSE_TEXT,tessedit_char_whitelist:''});
       }
       return summarizeCodePasses(passes);
     }
+
     function showCodeReading(reading, label) {
       el('text' + label + 'Val').textContent = reading.state === 'read' ? reading.code : reading.state === 'ambiguous' ? '要確認：候補 ' + reading.candidates.join('・') : reading.state === 'uncertain' ? '要確認：不鮮明な候補 ' + reading.candidates.join('・') : '（対象コード未検出）';
       el('detail' + label).textContent = label + 'の認識結果\n' + reading.rawText;
@@ -531,7 +454,7 @@
         el('resultArea').hidden = false;
         if (typeof Tesseract === 'undefined') throw new Error('文字認識ライブラリを読み込めません。通信環境を確認してください。');
         status('コード認識を準備しています。初回は読み込みに時間がかかります。');
-        worker = await Tesseract.createWorker('eng', 1);
+        worker = await Tesseract.createWorker('eng', 1, {}, {load_system_dawg:'0',load_freq_dawg:'0',load_number_dawg:'0',load_punc_dawg:'0'});
         await worker.setParameters({ tessedit_pageseg_mode: Tesseract.PSM.SPARSE_TEXT, user_defined_dpi: '300' });
         const readingA = await recognizeCode(worker, imageA, 'A');
         applyCodeReading(logContext, 'A', readingA);
