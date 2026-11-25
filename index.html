@@ -40,9 +40,20 @@
     </select>
     <label for="captureMode">撮影画質</label>
     <select id="captureMode"><option value="photo">高画質静止画を優先（対応端末）</option><option value="video">従来の連写</option></select>
-    <small>無料・手持ち撮影V7.2。手持ちの小さな揺れで撮影を中断しません。枠に文字を入れたまま、できるだけ同じ位置でお待ちください。対応端末では高画質写真を最大3枚撮り、A・Bの鮮明さを比較して選びます。進み具合は撮影ボタンの下に表示します。</small>
+    <small>無料・手持ち撮影V7.3。手持ちの小さな揺れで撮影を中断しません。枠に文字を入れたまま、できるだけ同じ位置でお待ちください。対応端末では高画質写真を最大3枚撮り、A・Bの鮮明さを比較して選びます。進み具合は撮影ボタンの下に表示します。</small>
     <p id="status" role="status" aria-live="polite">マスターを読み込んでいます。</p>
   </div>
+  <details class="card" id="savedImageDiagnostics">
+    <summary>保存済みのA・B画像で認識を確認する（診断）</summary>
+    <p>撮影時と同じ認識処理で確認します。画像はスマホ内で処理し、この診断結果は判定履歴に記録しません。</p>
+    <label for="diagnosticFileA">Aの保存画像を選ぶ</label><input id="diagnosticFileA" type="file" accept="image/*">
+    <label for="diagnosticFileB">Bの保存画像を選ぶ</label><input id="diagnosticFileB" type="file" accept="image/*">
+    <label><input id="diagnosticRefresh" type="checkbox" checked> 認識データを再取得して確認する（通信が必要です）</label>
+    <button id="diagnosticBtn">この2枚で認識を確認する</button>
+    <p id="diagnosticStatus" class="ocr-text" role="status" aria-live="polite">A・B両方の画像を選んでください。</p>
+    <pre id="diagnosticResult" class="ocr-text"></pre>
+    <a id="downloadDiagnostic" href="#" download="saved-image-diagnosis.txt" hidden>診断結果をファイルで保存</a>
+  </details>
   <div class="card" id="cameraCard" hidden>
     <p>2. 赤枠の中に文字を合わせて撮影</p>
     <div id="cameraContainer">
@@ -84,10 +95,49 @@
     let saving = false;
     let cameraPhotoUrl = null;
     let focusInfo = 'ピント：端末の自動設定';
+    let diagnosticBusy = false;
+    async function createCodeWorker(refresh=false) {
+      const worker=await Tesseract.createWorker('eng',1,refresh?{cacheMethod:'refresh'}:{},{load_system_dawg:'0',load_freq_dawg:'0',load_number_dawg:'0',load_punc_dawg:'0'});
+      try{await worker.setParameters({tessedit_pageseg_mode:Tesseract.PSM.SPARSE_TEXT,user_defined_dpi:'300'});return worker;}
+      catch(error){try{await worker.terminate();}catch(_){}throw error;}
+    }
+    async function diagnoseSavedImages() {
+      if(busy||saving||pendingRecord)return;
+      const a=el('diagnosticFileA').files?.[0],b=el('diagnosticFileB').files?.[0];
+      if(!a||!b){el('diagnosticStatus').textContent='A・B両方の保存画像を選んでください。';return;}
+      busy=true;diagnosticBusy=true;updateSaveControls();
+      el('diagnosticResult').textContent='';el('downloadDiagnostic').hidden=true;
+      let worker;
+      const results=[];
+      const refresh=el('diagnosticRefresh').checked;
+      try {
+        status('保存画像の診断を準備中。初回・再取得時は認識データを読み込みます。');
+        if(typeof Tesseract==='undefined')throw new Error('文字認識ライブラリを読み込めません。通信環境を確認してください。');
+        worker=await createCodeWorker(refresh);
+        for(const [label,file] of [['A',a],['B',b]]) {
+          const bitmap=await decodeCameraPhoto(file,8000);
+          try {
+            if(bitmap.width*bitmap.height>4000000)throw new Error('切り抜き画像を選んでください。全体写真はこの診断では扱いません。');
+            const reading=await recognizeCode(worker,bitmap,label);
+            results.push({label,file:file.name,width:bitmap.width,height:bitmap.height,...reading});
+            el('diagnosticResult').textContent=results.map(item=>item.label+'：'+(item.code||item.candidates.join('・')||'未検出')+'（'+item.width+' × '+item.height+' px）').join('\n');
+          }finally{if(typeof bitmap.close==='function')bitmap.close();}
+        }
+        const verdict=judgeCodeResults(results[0],results[1]);
+        el('diagnosticResult').textContent+='\n診断判定：'+verdict;
+        status('保存画像の診断が完了しました。この診断は履歴に保存していません。');
+      }catch(error){status('保存画像の診断エラー：'+error.message);}
+      finally {
+        if(worker){try{await worker.terminate();}catch(_){}}
+        const report=['パッケージ照合アプリ V7.3 保存画像診断','日時：'+new Date().toISOString(),'利用環境：'+(typeof navigator!=='undefined'?navigator.userAgent:'取得なし'),'認識データ再取得：'+refresh,el('diagnosticStatus').textContent,el('diagnosticResult').textContent,...results.map(item=>item.label+'：'+item.file+'\n'+item.rawText)].join('\n\n');
+        el('downloadDiagnostic').href='data:text/plain;charset=utf-8,'+encodeURIComponent('\uFEFF'+report);el('downloadDiagnostic').hidden=false;
+        diagnosticBusy=false;busy=false;updateSaveControls();
+      }
+    }
     function prepareRecognitionReport() {
       const pkg=selectedPackage();
       const report=[
-        'パッケージ照合アプリ V7.2 読み取り詳細',
+        'パッケージ照合アプリ V7.3 読み取り詳細',
         '保存日時：'+new Date().toISOString(),
         'パッケージ：'+(pkg?String(pkg.packageId)+' '+String(pkg.packageName):'未選択'),
         'マスク座標：'+(pkg?JSON.stringify({a:pkg.a,b:pkg.b}):'なし'),
@@ -323,6 +373,7 @@
       record['rawText' + label] = reading.rawText;
     }
     function updateSaveControls() {
+      for(const id of ['diagnosticBtn','diagnosticFileA','diagnosticFileB','diagnosticRefresh'])el(id).disabled=busy||saving||!!pendingRecord;
       el('saveRetryBtn').hidden = !pendingRecord || saving;
       el('retryBtn').disabled = busy || saving || !!pendingRecord;
       el('packageSelect').disabled = busy || saving || !!pendingRecord;
@@ -368,6 +419,7 @@
       if (pendingRecord) { event.preventDefault(); event.returnValue = ''; }
     });
     function status(message) {
+      if(diagnosticBusy){el('diagnosticStatus').textContent=message;return;}
       el('status').textContent = message;
       if(el('cameraStatus'))el('cameraStatus').textContent=message;
       if (el('analysisStatus')) el('analysisStatus').textContent = message;
@@ -776,8 +828,7 @@
         el('resultArea').hidden = false;
         if (typeof Tesseract === 'undefined') throw new Error('文字認識ライブラリを読み込めません。通信環境を確認してください。');
         status('コード認識を準備しています。初回は読み込みに時間がかかります。');
-        worker = await Tesseract.createWorker('eng', 1, {}, {load_system_dawg:'0',load_freq_dawg:'0',load_number_dawg:'0',load_punc_dawg:'0'});
-        await worker.setParameters({ tessedit_pageseg_mode: Tesseract.PSM.SPARSE_TEXT, user_defined_dpi: '300' });
+        worker = await createCodeWorker();
         const readingA = await recognizeCode(worker, imageA, 'A');
         applyCodeReading(logContext, 'A', readingA);
         showCodeReading(readingA, 'A');
@@ -812,6 +863,7 @@
         updateSaveControls();
       }
     });
+    el('diagnosticBtn').addEventListener('click', diagnoseSavedImages);
     el('retryBtn').addEventListener('click', async () => {
       if (busy || !selectedPackage()) return;
       el('resultArea').hidden = true;
