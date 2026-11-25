@@ -40,7 +40,7 @@
     </select>
     <label for="captureMode">撮影画質</label>
     <select id="captureMode"><option value="photo">高画質静止画を優先（対応端末）</option><option value="video">従来の連写</option></select>
-    <small>無料・文字候補確認V6.2。撮影中はスマホを動かさずお待ちください。対応端末では、カメラの静止画を使って文字を読み取ります。</small>
+    <small>無料・撮影安定待ちV7。撮影ボタンを押したら、カメラ映像が消えるまで動かさずお待ちください。対応端末では高画質写真を3枚撮り、A・Bの鮮明さを比較して選びます。撮影に数秒以上かかる場合があります。</small>
     <p id="status" role="status" aria-live="polite">マスターを読み込んでいます。</p>
   </div>
   <div class="card" id="cameraCard" hidden>
@@ -82,14 +82,16 @@
     let pendingRecord = null;
     let saving = false;
     let cameraPhotoUrl = null;
+    let focusInfo = 'ピント：端末の自動設定';
     function prepareRecognitionReport() {
       const pkg=selectedPackage();
       const report=[
-        'パッケージ照合アプリ V6.2 読み取り詳細',
+        'パッケージ照合アプリ V7 読み取り詳細',
         '保存日時：'+new Date().toISOString(),
         'パッケージ：'+(pkg?String(pkg.packageId)+' '+String(pkg.packageName):'未選択'),
         'マスク座標：'+(pkg?JSON.stringify({a:pkg.a,b:pkg.b}):'なし'),
         el('captureInfo').textContent,
+        focusInfo,
         'A画像サイズ：'+el('imageSizeA').textContent,
         'B画像サイズ：'+el('imageSizeB').textContent,
         'Aコード：'+el('textAVal').textContent,
@@ -412,7 +414,9 @@
         mediaStream = stream;
         video.srcObject = stream;
         await video.play();
+        const configuredFocus=await configureCameraFocus(stream.getVideoTracks()[0]);
         if (generation !== cameraGeneration) return;
+        focusInfo=configuredFocus;
         el('captureBtn').disabled = false;
         status('赤枠に文字を合わせ、ピントが合ってから撮影してください。');
       } catch (error) {
@@ -457,6 +461,50 @@
     function combinedSharpness(a,b) {
       // 片方だけが鮮明な写真より、両方が写っている写真を優先する。
       return 2/(1/(a+1)+1/(b+1));
+    }
+    async function configureCameraFocus(track) {
+      try {
+        if(!track||typeof track.getCapabilities!=='function'||typeof track.applyConstraints!=='function')return 'ピント：端末の自動設定（ブラウザからの調整に未対応）';
+        const capabilities=track.getCapabilities();
+        if(!Array.isArray(capabilities.focusMode)||!capabilities.focusMode.includes('continuous'))return 'ピント：端末の自動設定（継続オートフォーカスの指定に未対応）';
+        await cameraOperation(track.applyConstraints({advanced:[{focusMode:'continuous'}]}),2000);
+        const settings=typeof track.getSettings==='function'?track.getSettings():{};
+        return settings.focusMode==='continuous'?'ピント：継続オートフォーカス':'ピント：継続オートフォーカスを要求（反映は確認できません）';
+      }catch(_){return 'ピント：端末の自動設定（調整要求を適用できませんでした）';}
+    }
+    function motionDifference(first,second) {
+      if(!first.length||first.length!==second.length)return Infinity;
+      let a=0,b=0;for(let i=0;i<first.length;i++){a+=first[i];b+=second[i];}a/=first.length;b/=second.length;
+      let difference=0;for(let i=0;i<first.length;i++)difference+=Math.abs((first[i]-a)-(second[i]-b));
+      return difference/first.length;
+    }
+    function sampleMotionRegions(pkg) {
+      return [pkg.a,pkg.b].map(area=>{
+        const canvas=document.createElement('canvas');canvas.width=80;canvas.height=64;
+        const context=canvas.getContext('2d',{willReadFrequently:true});
+        context.drawImage(video,video.videoWidth*area.x/100,video.videoHeight*area.y/100,video.videoWidth*area.w/100,video.videoHeight*area.h/100,0,0,80,64);
+        const pixels=context.getImageData(0,0,80,64).data,gray=new Float32Array(80*64);
+        for(let i=0;i<gray.length;i++)gray[i]=pixels[i*4]*.299+pixels[i*4+1]*.587+pixels[i*4+2]*.114;
+        return gray;
+      });
+    }
+    function assertLiveCamera(generation) {
+      if(generation!==cameraGeneration||!mediaStream||video.readyState<2||!video.videoWidth||!video.videoHeight)throw new Error('撮影中に映像が停止しました。もう一度撮影してください。');
+    }
+    async function waitForCameraStability(pkg,generation,options={}) {
+      let previous=null,stable=0;
+      const interval=options.intervalMs??180,limit=options.maxSamples??28,required=options.required??3;
+      for(let index=0;index<limit;index++) {
+        assertLiveCamera(generation);
+        const current=sampleMotionRegions(pkg);
+        const movement=previous?Math.max(...current.map((gray,i)=>motionDifference(previous[i],gray))):Infinity;
+        stable=movement<=4?stable+1:0;
+        status('揺れの確認中：動きを止めてください（安定 '+stable+'/'+required+'）。');
+        if(stable>=required)return;
+        previous=current;
+        await new Promise(resolve=>setTimeout(resolve,interval));
+      }
+      const error=new Error('揺れが収まりませんでした。スマホを支えて、もう一度撮影してください。');error.code='CAMERA_MOVING';throw error;
     }
     async function captureBestFrame(pkg) {
       const a=validateArea(pkg.a,'A'),b=validateArea(pkg.b,'B');
@@ -563,14 +611,16 @@
       finally{clearTimeout(timer);}
     }
     async function captureInspectionFrame(pkg) {
+      const generation=cameraGeneration;
+      await waitForCameraStability(pkg,generation);
       const reference=await captureBestFrame(pkg);
       reference.captureInfo='従来の連写：'+reference.width+' × '+reference.height+' px';
       if(el('captureMode').value==='video')return reference;
       if(typeof ImageCapture!=='function'||typeof createImageBitmap!=='function') {
         reference.captureInfo+='（このブラウザは高画質静止画に未対応）';return reference;
       }
-      let photo;
-      const generation=cameraGeneration;
+      let best=null,bestScore=-1,bestBlob=null,bestIndex=0,shots=0,accepted=0;
+      const reasons=[];
       try{
         status('高画質静止画を撮影しています。スマホを動かさずお待ちください。');
         const track=mediaStream&&mediaStream.getVideoTracks()[0];
@@ -580,25 +630,48 @@
         const maxWidth=Number(capabilities.imageWidth&&capabilities.imageWidth.max),maxHeight=Number(capabilities.imageHeight&&capabilities.imageHeight.max);
         const settings={};
         if(maxWidth>0&&maxHeight>0)settings.imageWidth=Math.round(maxWidth*Math.min(1,4096/Math.max(maxWidth,maxHeight)));
-        const blob=await cameraOperation(capturer.takePhoto(settings),8000);
-        setPhotoDiagnostics(blob,reference);
-        photo=await createImageBitmap(blob);
-        if(generation!==cameraGeneration)throw new Error('撮影が中断されました。');
-        status('撮影範囲の拡大率と位置を合わせています。');
-        const match=matchPhotoOrientation(photo,reference,pkg);
-        const crop=photoWindowGeometry(photo.width,photo.height,match.angle,reference.width/reference.height,match);
-        if(match.score<.55||(Number.isFinite(match.a)&&match.a<.25)||(Number.isFinite(match.b)&&match.b<.25)) {reference.captureInfo+='（静止画と画角が一致しなかったため）';return reference;}
-        if(crop.width*crop.height<=reference.width*reference.height*1.1) {reference.captureInfo+='（静止画の画素数が増えなかったため）';return reference;}
-        const canvas=alignPhoto(photo,reference,match);
-        canvas.captureInfo='高画質静止画：'+canvas.width+' × '+canvas.height+' px';
-        reference.width=reference.height=1;
-        return canvas;
+        for(let index=0;index<3;index++) {
+          let photo;
+          try {
+            await waitForCameraStability(pkg,generation);
+            assertLiveCamera(generation);
+            status('高画質写真を撮影中（'+(index+1)+'/3）。カメラ映像が消えるまで動かさないでください。');
+            const blob=await cameraOperation(capturer.takePhoto(settings),8000);shots++;
+            if(!best)setPhotoDiagnostics(blob,reference);
+            photo=await createImageBitmap(blob);
+            assertLiveCamera(generation);
+            status('写真'+(index+1)+'の撮影範囲と鮮明さを確認しています。');
+            const match=matchPhotoOrientation(photo,reference,pkg);
+            const crop=photoWindowGeometry(photo.width,photo.height,match.angle,reference.width/reference.height,match);
+            if(match.score<.55||(Number.isFinite(match.a)&&match.a<.25)||(Number.isFinite(match.b)&&match.b<.25)){reasons.push('写真'+(index+1)+'：静止画と画角が一致しなかったため');continue;}
+            if(crop.width*crop.height<=reference.width*reference.height*1.1){reasons.push('写真'+(index+1)+'：静止画の画素数が増えなかったため');continue;}
+            const canvas=alignPhoto(photo,reference,match);
+            let score;
+            try{score=combinedSharpness(regionSharpness(canvas,pkg.a),regionSharpness(canvas,pkg.b));}
+            catch(error){canvas.width=canvas.height=1;throw error;}
+            accepted++;
+            reasons.push('写真'+(index+1)+'：鮮明さ指標 '+score.toFixed(1));
+            if(score>bestScore){if(best)best.width=best.height=1;best=canvas;bestScore=score;bestBlob=blob;bestIndex=index+1;}
+            else canvas.width=canvas.height=1;
+          }catch(error){
+            if(generation!==cameraGeneration)throw error;
+            if(error.code==='CAMERA_MOVING')throw error;
+            reasons.push('写真'+(index+1)+'：撮影・確認に失敗');
+            console.warn('静止画の撮影・確認に失敗',error);
+          }finally{if(photo&&typeof photo.close==='function')photo.close();}
+        }
+        if(best){
+          setPhotoDiagnostics(bestBlob,reference);
+          best.captureInfo='高画質静止画：'+best.width+' × '+best.height+' px／'+shots+'枚撮影・'+accepted+'枚比較・写真'+bestIndex+'を採用\n'+focusInfo+'\n'+reasons.join('\n');
+          reference.width=reference.height=1;return best;
+        }
+        reference.captureInfo+='（高画質写真を採用できなかったため）\n'+focusInfo+'\n'+reasons.join('\n');return reference;
       }catch(error){
-        if(generation!==cameraGeneration)throw error;
+        if(best)best.width=best.height=1;
+        if(generation!==cameraGeneration||error.code==='CAMERA_MOVING'){reference.width=reference.height=1;throw error;}
         console.warn('高画質撮影を利用できませんでした',error);
         reference.captureInfo+='（この端末では高画質撮影を利用できなかったため）';return reference;
       }
-      finally{if(photo&&typeof photo.close==='function')photo.close();}
     }
     function setResult(text, className = 'pending') {
       el('finalResult').textContent = text;
@@ -674,6 +747,10 @@
         pendingRecord = logContext;
         await savePendingRecord();
       } catch (error) {
+        if(error.code==='CAMERA_MOVING') {
+          setResult('再撮影');status(error.message);el('saveStatus').textContent='履歴：揺れのため撮影を中断（未判定・未保存）';
+          el('resultArea').hidden=false;return;
+        }
         setResult('処理エラー');
         el('resultArea').hidden = false;
         status('処理エラー：' + error.message);
