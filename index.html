@@ -40,7 +40,7 @@
     </select>
     <label for="captureMode">撮影画質</label>
     <select id="captureMode"><option value="photo">高画質静止画を優先（対応端末）</option><option value="video">従来の連写</option></select>
-    <small>無料・撮影進捗表示V7.1。撮影ボタンを押したら、カメラ映像が消えるまで動かさずお待ちください。対応端末では高画質写真を最大3枚撮り、A・Bの鮮明さを比較して選びます。進み具合は撮影ボタンの下に表示します。</small>
+    <small>無料・手持ち撮影V7.2。手持ちの小さな揺れで撮影を中断しません。枠に文字を入れたまま、できるだけ同じ位置でお待ちください。対応端末では高画質写真を最大3枚撮り、A・Bの鮮明さを比較して選びます。進み具合は撮影ボタンの下に表示します。</small>
     <p id="status" role="status" aria-live="polite">マスターを読み込んでいます。</p>
   </div>
   <div class="card" id="cameraCard" hidden>
@@ -87,7 +87,7 @@
     function prepareRecognitionReport() {
       const pkg=selectedPackage();
       const report=[
-        'パッケージ照合アプリ V7.1 読み取り詳細',
+        'パッケージ照合アプリ V7.2 読み取り詳細',
         '保存日時：'+new Date().toISOString(),
         'パッケージ：'+(pkg?String(pkg.packageId)+' '+String(pkg.packageName):'未選択'),
         'マスク座標：'+(pkg?JSON.stringify({a:pkg.a,b:pkg.b}):'なし'),
@@ -494,19 +494,22 @@
       if(generation!==cameraGeneration||!mediaStream||video.readyState<2||!video.videoWidth||!video.videoHeight)throw new Error('撮影中に映像が停止しました。もう一度撮影してください。');
     }
     async function waitForCameraStability(pkg,generation,options={}) {
-      let previous=null,stable=0;
-      const interval=options.intervalMs??180,limit=options.maxSamples??28,required=options.required??3;
+      let previous=null,stable=0,movement=Infinity,minimum=Infinity;
+      // 手持ちの揺れは撮影を拒否する条件にしない。短時間だけ良い瞬間を待つ。
+      const interval=options.intervalMs??100,limit=options.maxSamples??6,required=options.required??2;
       for(let index=0;index<limit;index++) {
         assertLiveCamera(generation);
         const current=sampleMotionRegions(pkg);
-        const movement=previous?Math.max(...current.map((gray,i)=>motionDifference(previous[i],gray))):Infinity;
+        movement=previous?Math.max(...current.map((gray,i)=>motionDifference(previous[i],gray))):Infinity;
+        minimum=Math.min(minimum,movement);
         stable=movement<=4?stable+1:0;
-        status('揺れの確認中：動きを止めてください（安定 '+stable+'/'+required+'）。');
-        if(stable>=required)return;
+        status('手持ち撮影の準備中。枠に文字を入れたままお待ちください。');
+        if(stable>=required)return {stable:true,movement};
         previous=current;
-        await new Promise(resolve=>setTimeout(resolve,interval));
+        if(index<limit-1)await new Promise(resolve=>setTimeout(resolve,interval));
       }
-      const error=new Error('揺れが収まりませんでした。スマホを支えて、もう一度撮影してください。');error.code='CAMERA_MOVING';throw error;
+      status('手持ちの揺れを検出しました。連写して鮮明な写真を選びます。');
+      return {stable:false,movement:minimum};
     }
     async function captureBestFrame(pkg) {
       const a=validateArea(pkg.a,'A'),b=validateArea(pkg.b,'B');
@@ -516,7 +519,7 @@
       await new Promise(resolve=>setTimeout(resolve,200));
       for(let index=0;index<5;index++) {
         if(generation!==cameraGeneration || !mediaStream || video.readyState<2 || !video.videoWidth || !video.videoHeight) throw new Error('撮影中に映像が停止しました。もう一度撮影してください。');
-        status('連写中（'+(index+1)+'/5）。約1秒間、スマホを動かさずお待ちください。');
+        status('手持ち連写中（'+(index+1)+'/5）。枠に文字を入れたままお待ちください。');
         const frame=document.createElement('canvas');
         frame.width=video.videoWidth;frame.height=video.videoHeight;
         frame.getContext('2d').drawImage(video,0,0);
@@ -644,9 +647,11 @@
     }
     async function captureInspectionFrame(pkg) {
       const generation=cameraGeneration;
-      await waitForCameraStability(pkg,generation);
+      const initialMotion=await waitForCameraStability(pkg,generation);
       const reference=await captureBestFrame(pkg);
       reference.captureInfo='従来の連写：'+reference.width+' × '+reference.height+' px';
+      reference.captureInfo+='／手持ち撮影（揺れで中断しません）';
+      if(initialMotion&&!initialMotion.stable)reference.captureInfo+='／撮影前に揺れを検出';
       if(el('captureMode').value==='video')return reference;
       if(typeof ImageCapture!=='function'||typeof createImageBitmap!=='function') {
         reference.captureInfo+='（このブラウザは高画質静止画に未対応）';return reference;
@@ -655,7 +660,7 @@
       const captureDeadline=Date.now()+22000;
       const reasons=[];
       try{
-        status('高画質静止画を撮影しています。スマホを動かさずお待ちください。');
+        status('高画質静止画を準備しています。枠に文字を入れたままお待ちください。');
         const track=mediaStream&&mediaStream.getVideoTracks()[0];
         if(!track||track.readyState!=='live')throw new Error('カメラが停止しています。');
         const capturer=new ImageCapture(track);
@@ -667,9 +672,10 @@
           if(Date.now()>captureDeadline){reasons.push('撮影の待ち時間が長いため、追加撮影を終了');break;}
           let photo;
           try {
-            await waitForCameraStability(pkg,generation);
+            const motion=await waitForCameraStability(pkg,generation);
+            if(motion&&!motion.stable)reasons.push('写真'+(index+1)+'：手持ちの揺れを検出・撮影を継続');
             assertLiveCamera(generation);
-            status('高画質写真を撮影中（'+(index+1)+'/3）。カメラ映像が消えるまで動かさないでください。');
+            status('高画質写真を撮影中（'+(index+1)+'/3）。枠に文字を入れたままお待ちください。');
             el('captureBtn').textContent='高画質撮影 '+(index+1)+'/3';
             const blob=await cameraOperation(capturer.takePhoto(settings),6000);shots++;
             if(!best)setPhotoDiagnostics(blob,reference);
@@ -692,7 +698,6 @@
             else canvas.width=canvas.height=1;
           }catch(error){
             if(generation!==cameraGeneration)throw error;
-            if(error.code==='CAMERA_MOVING')throw error;
             reasons.push('写真'+(index+1)+'：撮影・確認に失敗');
             console.warn('静止画の撮影・確認に失敗',error);
             if(error.code==='CAMERA_TIMEOUT'){reasons.push('カメラの応答待ちを終了');break;}
@@ -700,13 +705,13 @@
         }
         if(best){
           setPhotoDiagnostics(bestBlob,reference);
-          best.captureInfo='高画質静止画：'+best.width+' × '+best.height+' px／'+shots+'枚撮影・'+accepted+'枚比較・写真'+bestIndex+'を採用\n'+focusInfo+'\n'+reasons.join('\n');
+          best.captureInfo='高画質静止画：'+best.width+' × '+best.height+' px／手持ち撮影／'+shots+'枚撮影・'+accepted+'枚比較・写真'+bestIndex+'を採用\n'+focusInfo+'\n'+reasons.join('\n');
           reference.width=reference.height=1;return best;
         }
         reference.captureInfo+='（高画質写真を採用できなかったため）\n'+focusInfo+'\n'+reasons.join('\n');return reference;
       }catch(error){
         if(best)best.width=best.height=1;
-        if(generation!==cameraGeneration||error.code==='CAMERA_MOVING'){reference.width=reference.height=1;throw error;}
+        if(generation!==cameraGeneration){reference.width=reference.height=1;throw error;}
         console.warn('高画質撮影を利用できませんでした',error);
         reference.captureInfo+='（この端末では高画質撮影を利用できなかったため）';return reference;
       }
@@ -725,7 +730,7 @@
       if (busy) return;
       busy = true;
       el('captureBtn').disabled = true;
-      el('captureBtn').textContent = '撮影中…動かさずお待ちください';
+      el('captureBtn').textContent = '手持ち撮影中…';
       el('packageSelect').disabled = true;
       el('languageSelect').disabled = true;
       el('captureMode').disabled = true;
@@ -786,10 +791,6 @@
         pendingRecord = logContext;
         await savePendingRecord();
       } catch (error) {
-        if(error.code==='CAMERA_MOVING') {
-          setResult('再撮影');status(error.message);el('saveStatus').textContent='履歴：揺れのため撮影を中断（未判定・未保存）';
-          el('resultArea').hidden=false;return;
-        }
         setResult('処理エラー');
         el('resultArea').hidden = false;
         status('処理エラー：' + error.message);
