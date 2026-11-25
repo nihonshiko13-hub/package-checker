@@ -40,7 +40,7 @@
     </select>
     <label for="captureMode">撮影画質</label>
     <select id="captureMode"><option value="photo">高画質静止画を優先（対応端末）</option><option value="video">従来の連写</option></select>
-    <small>無料・高画質撮影V4。撮影中はスマホを動かさずお待ちください。対応端末では、カメラの静止画を使って文字を読み取ります。</small>
+    <small>無料・画角補正V5。撮影中はスマホを動かさずお待ちください。対応端末では、カメラの静止画を使って文字を読み取ります。</small>
     <p id="status" role="status" aria-live="polite">マスターを読み込んでいます。</p>
   </div>
   <div class="card" id="cameraCard" hidden>
@@ -56,6 +56,7 @@
     <h2>判定結果</h2>
     <p id="analysisStatus" role="status" aria-live="polite"></p>
     <p id="captureInfo"></p>
+    <details id="photoDiagnostics" hidden><summary>撮影範囲を確認する</summary><p><a id="downloadCameraPhoto" download="camera-photo.jpg" hidden>カメラ写真（全体）を保存</a></p><p><a id="downloadReferenceFrame" download="preview-frame.png" hidden>比較用の映像（全体）を保存</a></p></details>
     <div class="previews">
       <div><p>Aの切り抜き画像</p><img id="previewA" alt="A位置の切り抜き画像"><small id="imageSizeA"></small><a id="downloadA" download="A-crop.png" hidden>A画像を保存</a></div>
       <div><p>Bの切り抜き画像</p><img id="previewB" alt="B位置の切り抜き画像"><small id="imageSizeB"></small><a id="downloadB" download="B-crop.png" hidden>B画像を保存</a></div>
@@ -79,6 +80,21 @@
     let logApiReady = false;
     let pendingRecord = null;
     let saving = false;
+    let cameraPhotoUrl = null;
+    function clearPhotoDiagnostics() {
+      if(cameraPhotoUrl&&typeof URL!=='undefined')URL.revokeObjectURL(cameraPhotoUrl);
+      cameraPhotoUrl=null;
+      el('photoDiagnostics').hidden=true;
+      for(const id of ['downloadCameraPhoto','downloadReferenceFrame']){el(id).hidden=true;el(id).removeAttribute('href');}
+    }
+    function setPhotoDiagnostics(blob,reference) {
+      if(typeof URL!=='undefined'&&typeof URL.createObjectURL==='function') {
+        cameraPhotoUrl=URL.createObjectURL(blob);el('downloadCameraPhoto').href=cameraPhotoUrl;
+        el('downloadCameraPhoto').download=blob.type==='image/png'?'camera-photo.png':'camera-photo.jpg';el('downloadCameraPhoto').hidden=false;
+      }
+      if(typeof reference.toDataURL==='function') {el('downloadReferenceFrame').href=reference.toDataURL('image/png');el('downloadReferenceFrame').hidden=false;}
+      el('photoDiagnostics').hidden=false;
+    }
     const MIN_CODE_CONFIDENCE = 60;
     function normalizeCodeText(text) {
       return String(text || '').normalize('NFKC').toUpperCase();
@@ -417,35 +433,71 @@
       let aa=0,bb=0,ab=0;for(let i=0;i<a.length;i++){const x=a[i]-ma,y=b[i]-mb;aa+=x*x;bb+=y*y;ab+=x*y;}
       return aa>0&&bb>0?ab/Math.sqrt(aa*bb):-1;
     }
-    function orientationThumbnail(source,angle,aspect) {
-      const crop=centerPhotoGeometry(source.width,source.height,angle,aspect);
-      const canvas=document.createElement('canvas');canvas.width=64;canvas.height=Math.max(1,Math.round(64/aspect));
-      const context=canvas.getContext('2d',{willReadFrequently:true});
-      const scale=canvas.width/crop.width;
+    function photoWindowGeometry(width,height,angle,aspect,options={}) {
+      const base=centerPhotoGeometry(width,height,angle,aspect),sideways=angle===90||angle===270;
+      const rotatedWidth=sideways?height:width,rotatedHeight=sideways?width:height;
+      const factor=Math.max(.55,Math.min(1,Number(options.factor)||1));
+      const w=Math.max(1,Math.round(base.width*factor)),h=Math.max(1,Math.round(base.height*factor));
+      const maxX=(rotatedWidth-w)/2,maxY=(rotatedHeight-h)/2;
+      const offsetX=Math.max(-maxX,Math.min(maxX,(Number(options.dx)||0)*base.width));
+      const offsetY=Math.max(-maxY,Math.min(maxY,(Number(options.dy)||0)*base.height));
+      return {width:w,height:h,offsetX,offsetY,x:rotatedWidth/2+offsetX-w/2,y:rotatedHeight/2+offsetY-h/2};
+    }
+    function orientationThumbnail(source,angle,aspect,options={},resolution=64) {
+      const crop=photoWindowGeometry(source.width,source.height,angle,aspect,options);
+      const canvas=document.createElement('canvas');canvas.width=resolution;canvas.height=Math.max(1,Math.round(resolution/aspect));
+      const context=canvas.getContext('2d',{willReadFrequently:true}),scale=canvas.width/crop.width;
       context.fillStyle='white';context.fillRect(0,0,canvas.width,canvas.height);
-      context.translate(canvas.width/2,canvas.height/2);context.rotate(angle*Math.PI/180);context.scale(scale,scale);
-      context.drawImage(source,-source.width/2,-source.height/2);
-      const pixels=context.getImageData(0,0,canvas.width,canvas.height).data;
-      const gray=new Float32Array(canvas.width*canvas.height);
+      context.translate(canvas.width/2-crop.offsetX*scale,canvas.height/2-crop.offsetY*scale);
+      context.rotate(angle*Math.PI/180);context.scale(scale,scale);context.drawImage(source,-source.width/2,-source.height/2);
+      const pixels=context.getImageData(0,0,canvas.width,canvas.height).data,gray=new Float32Array(canvas.width*canvas.height);
       for(let i=0;i<gray.length;i++)gray[i]=pixels[i*4]*.299+pixels[i*4+1]*.587+pixels[i*4+2]*.114;
       return gray;
     }
-    function matchPhotoOrientation(photo,reference) {
-      const aspect=reference.width/reference.height,target=orientationThumbnail(reference,0,aspect);
-      let best={angle:0,score:-1};
-      for(const angle of [0,90,180,270]) {
-        const score=normalizedCorrelation(target,orientationThumbnail(photo,angle,aspect));
-        if(score>best.score)best={angle,score};
+    function regionCorrelation(a,b,width,height,area) {
+      const left=Math.max(0,Math.floor(width*area.x/100)),top=Math.max(0,Math.floor(height*area.y/100));
+      const right=Math.min(width,Math.ceil(width*(area.x+area.w)/100)),bottom=Math.min(height,Math.ceil(height*(area.y+area.h)/100));
+      const first=[],second=[];for(let y=top;y<bottom;y++)for(let x=left;x<right;x++){first.push(a[y*width+x]);second.push(b[y*width+x]);}
+      return normalizedCorrelation(first,second);
+    }
+    function matchPhotoOrientation(photo,reference,pkg) {
+      const aspect=reference.width/reference.height;
+      const targets={64:orientationThumbnail(reference,0,aspect,{},64),96:orientationThumbnail(reference,0,aspect,{},96)};
+      let best={angle:0,factor:1,dx:0,dy:0,score:-1,rank:-2};
+      const seen=new Set();
+      function evaluate(angle,factor,dx,dy,resolution) {
+        if(factor<.55||factor>1)return;
+        const geometry=photoWindowGeometry(photo.width,photo.height,angle,aspect,{factor,dx,dy});
+        const key=[resolution,angle,geometry.width,geometry.height,Math.round(geometry.x),Math.round(geometry.y)].join(',');
+        if(seen.has(key))return;seen.add(key);
+        const candidate=orientationThumbnail(photo,angle,aspect,{factor,dx,dy},resolution),target=targets[resolution];
+        const score=normalizedCorrelation(target,candidate);
+        let rank=score,a,b;
+        if(pkg&&resolution===96) {
+          const height=Math.max(1,Math.round(resolution/aspect));
+          a=regionCorrelation(target,candidate,resolution,height,pkg.a);b=regionCorrelation(target,candidate,resolution,height,pkg.b);
+          rank=.6*score+.2*a+.2*b;
+        }
+        if(rank>best.rank)best={angle,factor,dx,dy,score,rank,a,b};
+      }
+      // 静止画と動画の中央位置だけでなく、画角と上下左右のずれを探索する。
+      for(const angle of [0,90,180,270])for(const factor of [1,.9,.8,.7,.6])for(const dx of [0,-.12,.12])for(const dy of [0,-.12,.12])evaluate(angle,factor,dx,dy,64);
+      // A・Bの両方が合う位置を、粗い探索の周囲で段階的に詰める。
+      const coarse=best;best={...coarse,rank:-2};
+      for(const [factorStep,shiftStep] of [[.05,.06],[.025,.03],[.0125,.015]]) {
+        const center={...best};
+        for(const df of [0,-factorStep,factorStep])for(const dx of [0,-shiftStep,shiftStep])for(const dy of [0,-shiftStep,shiftStep])evaluate(center.angle,center.factor+df,center.dx+dx,center.dy+dy,96);
       }
       return best;
     }
-    function alignPhoto(photo,reference,angle) {
-      const crop=centerPhotoGeometry(photo.width,photo.height,angle,reference.width/reference.height);
+    function alignPhoto(photo,reference,match) {
+      const parameters=typeof match==='number'?{angle:match}:match;
+      const crop=photoWindowGeometry(photo.width,photo.height,parameters.angle,reference.width/reference.height,parameters);
       const canvas=document.createElement('canvas');canvas.width=crop.width;canvas.height=crop.height;
-      const context=canvas.getContext('2d');context.translate(canvas.width/2,canvas.height/2);context.rotate(angle*Math.PI/180);
-      context.drawImage(photo,-photo.width/2,-photo.height/2);
-      return canvas;
+      const context=canvas.getContext('2d');context.translate(canvas.width/2-crop.offsetX,canvas.height/2-crop.offsetY);context.rotate(parameters.angle*Math.PI/180);
+      context.drawImage(photo,-photo.width/2,-photo.height/2);return canvas;
     }
+
     async function cameraOperation(promise,milliseconds) {
       let timer;
       try{return await Promise.race([promise,new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('撮影の応答が時間切れになりました。')),milliseconds);})]);}
@@ -470,13 +522,15 @@
         const settings={};
         if(maxWidth>0&&maxHeight>0)settings.imageWidth=Math.round(maxWidth*Math.min(1,4096/Math.max(maxWidth,maxHeight)));
         const blob=await cameraOperation(capturer.takePhoto(settings),8000);
+        setPhotoDiagnostics(blob,reference);
         photo=await createImageBitmap(blob);
         if(generation!==cameraGeneration)throw new Error('撮影が中断されました。');
-        const match=matchPhotoOrientation(photo,reference);
-        const crop=centerPhotoGeometry(photo.width,photo.height,match.angle,reference.width/reference.height);
-        if(match.score<.55) {reference.captureInfo+='（静止画と画角が一致しなかったため）';return reference;}
+        status('撮影範囲の拡大率と位置を合わせています。');
+        const match=matchPhotoOrientation(photo,reference,pkg);
+        const crop=photoWindowGeometry(photo.width,photo.height,match.angle,reference.width/reference.height,match);
+        if(match.score<.55||(Number.isFinite(match.a)&&match.a<.25)||(Number.isFinite(match.b)&&match.b<.25)) {reference.captureInfo+='（静止画と画角が一致しなかったため）';return reference;}
         if(crop.width*crop.height<=reference.width*reference.height*1.1) {reference.captureInfo+='（静止画の画素数が増えなかったため）';return reference;}
-        const canvas=alignPhoto(photo,reference,match.angle);
+        const canvas=alignPhoto(photo,reference,match);
         canvas.captureInfo='高画質静止画：'+canvas.width+' × '+canvas.height+' px';
         reference.width=reference.height=1;
         return canvas;
@@ -516,6 +570,7 @@
       el('detailB').textContent = '';
       el('saveStatus').textContent = '履歴：判定後に保存します';
       el('captureInfo').textContent = '';
+      clearPhotoDiagnostics();
       setResult('未判定');
       let logContext = null;
       let worker = null;
