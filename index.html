@@ -38,7 +38,9 @@
     <select id="languageSelect">
       <option value="eng">英字2文字＋数字2桁（例：AD80・BC12）</option>
     </select>
-    <small>無料・傾き補正V3。約1秒間、スマホを動かさず撮影してください。連写で選んだ画像を傾き補正し、コード4文字だけを評価します。</small>
+    <label for="captureMode">撮影画質</label>
+    <select id="captureMode"><option value="photo">高画質静止画を優先（対応端末）</option><option value="video">従来の連写</option></select>
+    <small>無料・高画質撮影V4。撮影中はスマホを動かさずお待ちください。対応端末では、カメラの静止画を使って文字を読み取ります。</small>
     <p id="status" role="status" aria-live="polite">マスターを読み込んでいます。</p>
   </div>
   <div class="card" id="cameraCard" hidden>
@@ -53,6 +55,7 @@
   <div class="card" id="resultArea" hidden>
     <h2>判定結果</h2>
     <p id="analysisStatus" role="status" aria-live="polite"></p>
+    <p id="captureInfo"></p>
     <div class="previews">
       <div><p>Aの切り抜き画像</p><img id="previewA" alt="A位置の切り抜き画像"><small id="imageSizeA"></small><a id="downloadA" download="A-crop.png" hidden>A画像を保存</a></div>
       <div><p>Bの切り抜き画像</p><img id="previewB" alt="B位置の切り抜き画像"><small id="imageSizeB"></small><a id="downloadB" download="B-crop.png" hidden>B画像を保存</a></div>
@@ -153,7 +156,8 @@
     }
     function makeRecognitionImage(source, angle, binary = false) {
       const radians=angle*Math.PI/180;
-      const scale=Math.min(3,1800/Math.max(source.width,source.height));
+      // 高画質写真を得た場合も、OCR側で過大に拡大しない。
+      const scale=Math.min(3,600/Math.min(source.width,source.height),1800/Math.max(source.width,source.height));
       const w=source.width*scale,h=source.height*scale;
       const canvas=document.createElement('canvas');
       canvas.width=Math.ceil(Math.abs(w*Math.cos(radians))+Math.abs(h*Math.sin(radians)))+40;
@@ -245,6 +249,7 @@
       el('retryBtn').disabled = busy || saving || !!pendingRecord;
       el('packageSelect').disabled = busy || saving || !!pendingRecord;
       el('captureBtn').disabled = busy || saving || !!pendingRecord || !mediaStream;
+      el('captureMode').disabled = busy || saving || !!pendingRecord;
     }
     async function savePendingRecord() {
       if (!pendingRecord || saving) return;
@@ -399,6 +404,89 @@
       }
       return best;
     }
+    function centerPhotoGeometry(width,height,angle,aspect) {
+      const sideways=angle===90||angle===270;
+      const rotatedWidth=sideways?height:width,rotatedHeight=sideways?width:height;
+      return rotatedWidth/rotatedHeight>aspect
+        ?{width:Math.max(1,Math.round(rotatedHeight*aspect)),height:rotatedHeight}
+        :{width:rotatedWidth,height:Math.max(1,Math.round(rotatedWidth/aspect))};
+    }
+    function normalizedCorrelation(a,b) {
+      if(a.length!==b.length||!a.length)return -1;
+      let ma=0,mb=0;for(let i=0;i<a.length;i++){ma+=a[i];mb+=b[i];}ma/=a.length;mb/=b.length;
+      let aa=0,bb=0,ab=0;for(let i=0;i<a.length;i++){const x=a[i]-ma,y=b[i]-mb;aa+=x*x;bb+=y*y;ab+=x*y;}
+      return aa>0&&bb>0?ab/Math.sqrt(aa*bb):-1;
+    }
+    function orientationThumbnail(source,angle,aspect) {
+      const crop=centerPhotoGeometry(source.width,source.height,angle,aspect);
+      const canvas=document.createElement('canvas');canvas.width=64;canvas.height=Math.max(1,Math.round(64/aspect));
+      const context=canvas.getContext('2d',{willReadFrequently:true});
+      const scale=canvas.width/crop.width;
+      context.fillStyle='white';context.fillRect(0,0,canvas.width,canvas.height);
+      context.translate(canvas.width/2,canvas.height/2);context.rotate(angle*Math.PI/180);context.scale(scale,scale);
+      context.drawImage(source,-source.width/2,-source.height/2);
+      const pixels=context.getImageData(0,0,canvas.width,canvas.height).data;
+      const gray=new Float32Array(canvas.width*canvas.height);
+      for(let i=0;i<gray.length;i++)gray[i]=pixels[i*4]*.299+pixels[i*4+1]*.587+pixels[i*4+2]*.114;
+      return gray;
+    }
+    function matchPhotoOrientation(photo,reference) {
+      const aspect=reference.width/reference.height,target=orientationThumbnail(reference,0,aspect);
+      let best={angle:0,score:-1};
+      for(const angle of [0,90,180,270]) {
+        const score=normalizedCorrelation(target,orientationThumbnail(photo,angle,aspect));
+        if(score>best.score)best={angle,score};
+      }
+      return best;
+    }
+    function alignPhoto(photo,reference,angle) {
+      const crop=centerPhotoGeometry(photo.width,photo.height,angle,reference.width/reference.height);
+      const canvas=document.createElement('canvas');canvas.width=crop.width;canvas.height=crop.height;
+      const context=canvas.getContext('2d');context.translate(canvas.width/2,canvas.height/2);context.rotate(angle*Math.PI/180);
+      context.drawImage(photo,-photo.width/2,-photo.height/2);
+      return canvas;
+    }
+    async function cameraOperation(promise,milliseconds) {
+      let timer;
+      try{return await Promise.race([promise,new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('撮影の応答が時間切れになりました。')),milliseconds);})]);}
+      finally{clearTimeout(timer);}
+    }
+    async function captureInspectionFrame(pkg) {
+      const reference=await captureBestFrame(pkg);
+      reference.captureInfo='従来の連写：'+reference.width+' × '+reference.height+' px';
+      if(el('captureMode').value==='video')return reference;
+      if(typeof ImageCapture!=='function'||typeof createImageBitmap!=='function') {
+        reference.captureInfo+='（このブラウザは高画質静止画に未対応）';return reference;
+      }
+      let photo;
+      const generation=cameraGeneration;
+      try{
+        status('高画質静止画を撮影しています。スマホを動かさずお待ちください。');
+        const track=mediaStream&&mediaStream.getVideoTracks()[0];
+        if(!track||track.readyState!=='live')throw new Error('カメラが停止しています。');
+        const capturer=new ImageCapture(track);
+        const capabilities=await cameraOperation(capturer.getPhotoCapabilities(),4000);
+        const maxWidth=Number(capabilities.imageWidth&&capabilities.imageWidth.max),maxHeight=Number(capabilities.imageHeight&&capabilities.imageHeight.max);
+        const settings={};
+        if(maxWidth>0&&maxHeight>0)settings.imageWidth=Math.round(maxWidth*Math.min(1,4096/Math.max(maxWidth,maxHeight)));
+        const blob=await cameraOperation(capturer.takePhoto(settings),8000);
+        photo=await createImageBitmap(blob);
+        if(generation!==cameraGeneration)throw new Error('撮影が中断されました。');
+        const match=matchPhotoOrientation(photo,reference);
+        const crop=centerPhotoGeometry(photo.width,photo.height,match.angle,reference.width/reference.height);
+        if(match.score<.55) {reference.captureInfo+='（静止画と画角が一致しなかったため）';return reference;}
+        if(crop.width*crop.height<=reference.width*reference.height*1.1) {reference.captureInfo+='（静止画の画素数が増えなかったため）';return reference;}
+        const canvas=alignPhoto(photo,reference,match.angle);
+        canvas.captureInfo='高画質静止画：'+canvas.width+' × '+canvas.height+' px';
+        reference.width=reference.height=1;
+        return canvas;
+      }catch(error){
+        if(generation!==cameraGeneration)throw error;
+        console.warn('高画質撮影を利用できませんでした',error);
+        reference.captureInfo+='（この端末では高画質撮影を利用できなかったため）';return reference;
+      }
+      finally{if(photo&&typeof photo.close==='function')photo.close();}
+    }
     function setResult(text, className = 'pending') {
       el('finalResult').textContent = text;
       el('finalResult').className = className;
@@ -416,6 +504,7 @@
       el('captureBtn').textContent = '撮影中…動かさずお待ちください';
       el('packageSelect').disabled = true;
       el('languageSelect').disabled = true;
+      el('captureMode').disabled = true;
       el('retryBtn').disabled = true;
       el('resultArea').hidden = true;
       el('previewA').removeAttribute('src');
@@ -426,6 +515,7 @@
       el('detailA').textContent = '';
       el('detailB').textContent = '';
       el('saveStatus').textContent = '履歴：判定後に保存します';
+      el('captureInfo').textContent = '';
       setResult('未判定');
       let logContext = null;
       let worker = null;
@@ -437,7 +527,8 @@
           throw new Error('映像の準備ができていません。もう一度撮影してください。');
         }
         // 同じフレームに写るA・Bを評価し、連写の中から1枚を選ぶ。
-        const frame = await captureBestFrame(pkg);
+        const frame = await captureInspectionFrame(pkg);
+        el('captureInfo').textContent=frame.captureInfo;
         const imageA = cropToCanvasBase64(frame, pkg.a, 'A');
         const imageB = cropToCanvasBase64(frame, pkg.b, 'B');
         logContext = { action: 'saveResult', recognitionMode: 'code-2letters-2digits-v1', saveId: crypto.randomUUID(), packageId: String(pkg.packageId), textA: '', textB: '', candidatesA: [], candidatesB: [], confidenceA: 0, confidenceB: 0, rawTextA: '', rawTextB: '', errorMessage: '' };
