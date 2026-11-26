@@ -40,7 +40,12 @@
     </select>
     <label for="captureMode">撮影画質</label>
     <select id="captureMode"><option value="photo">高画質静止画を優先（対応端末）</option><option value="video">従来の連写</option></select>
-    <small>無料・文字構成認識V9。手持ちで撮影できます。別々の写真でA・Bそれぞれのコードを2回以上確認して判定します。読み取りが食い違う場合や写真が不足する場合は「要確認」です。認識には従来より時間がかかる場合があります。進み具合は下に表示します。</small>
+    <label for="orientationA">A文字を正立させる回転</label>
+    <select id="orientationA"><option value="auto">自動</option><option value="0">回転なし（正立）</option><option value="90">右90°</option><option value="180">180°（上下逆）</option><option value="270">左90°</option></select>
+    <label for="orientationB">B文字を正立させる回転</label>
+    <select id="orientationB"><option value="auto">自動</option><option value="0">回転なし（正立）</option><option value="90">右90°</option><option value="180">180°（上下逆）</option><option value="270">左90°</option></select>
+    <small>コードの登録は不要です。文字の向きが決まっている場合は指定すると、別の向きの誤候補を避けて解析できます。設定はパッケージ別にこの端末へ保存します。</small>
+    <small>無料・向き指定認識V9.1。手持ちで撮影できます。別々の写真でA・Bそれぞれのコードを2回以上確認して判定します。読み取りが食い違う場合や写真が不足する場合は「要確認」です。認識には従来より時間がかかる場合があります。進み具合は下に表示します。</small>
     <p id="status" role="status" aria-live="polite">マスターを読み込んでいます。</p>
   </div>
   <details class="card" id="savedImageDiagnostics">
@@ -98,6 +103,17 @@
     let focusInfo = 'ピント：端末の自動設定';
     let diagnosticBusy = false;
     let recognitionProgress = '';
+    function getOrientationHints() {
+      const result={};for(const label of ['A','B']){const value=el('orientation'+label).value;if(['0','90','180','270'].includes(value))result[label]=Number(value);}return result;
+    }
+    function loadOrientationSettings() {
+      let stored={};
+      try{const pkg=selectedPackage();if(pkg)stored=JSON.parse(localStorage.getItem('package-checker-orientation:'+String(pkg.packageId))||'{}')||{};}catch(_){}
+      for(const label of ['A','B'])el('orientation'+label).value=['0','90','180','270'].includes(String(stored[label]))?String(stored[label]):'auto';
+    }
+    function saveOrientationSettings() {
+      try{const pkg=selectedPackage();if(pkg)localStorage.setItem('package-checker-orientation:'+String(pkg.packageId),JSON.stringify(getOrientationHints()));}catch(_){}
+    }
     function releaseRecognitionShots(shots=[]) {
       for(const shot of shots)for(const key of ['a','b'])if(shot[key])shot[key].width=shot[key].height=1;
     }
@@ -112,8 +128,9 @@
       const rawText=['複数写真の確認：独立した'+new Set(items.map(item=>item.id)).size+'枚を解析／'+(state==='read'?'2枚以上で一致を確認':'未確定'),'写真別の確定数：'+Array.from(support,([code,ids])=>code+'＝'+ids.size+'枚').join('・'),...items.map(item=>'['+item.id+'] '+item.reading.state+'／候補 '+item.reading.candidates.join('・')+'\n'+item.reading.rawText.slice(0,2600))].join('\n').slice(0,10000);
       return {state,code:state==='read'?winner:'',candidates:unique,confidence,rawText};
     }
-    async function recognizePhotoSet(worker,shots) {
+    async function recognizePhotoSet(worker,shots,options={}) {
       const sides={A:[],B:[]},seen=new Set(),hints={};
+      for(const label of ['A','B'])if([0,90,180,270].includes(options.orientationHints?.[label]))hints[label]=options.orientationHints[label];
       try {
         for(let index=0;index<shots.length;index++) {
           const shot=shots[index];if(seen.has(shot.id))continue;seen.add(shot.id);
@@ -121,8 +138,8 @@
             recognitionProgress='写真'+(index+1)+'/'+shots.length+'・'+label+'：';
             status('認識を確認しています。');
             const reading=await recognizeCode(worker,shot[label.toLowerCase()],label,{budgetMs:12000,orientationHint:hints[label]});
-            if(Number.isFinite(hints[label]))reading.rawText='前の写真で確認した文字方向：'+hints[label]+'度を優先して解析\n'+reading.rawText;
-            if(reading.state==='read'&&Number.isFinite(reading.orientationBase))hints[label]=reading.orientationBase;
+            if(Number.isFinite(hints[label]))reading.rawText='文字方向：'+hints[label]+'度を指定して解析（コードの値は前写真から引き継ぎません）\n'+reading.rawText;
+            if(![0,90,180,270].includes(options.orientationHints?.[label])&&reading.state==='read'&&Number.isFinite(reading.orientationBase))hints[label]=reading.orientationBase;
             sides[label].push({id:shot.id,reading});
           }
           const a=combinePhotoReadings(sides.A),b=combinePhotoReadings(sides.B);
@@ -147,6 +164,7 @@
       let worker;
       const results=[];
       const refresh=el('diagnosticRefresh').checked;
+      const orientationHints=getOrientationHints();
       try {
         status('保存画像の診断を準備中。初回・再取得時は認識データを読み込みます。');
         if(typeof Tesseract==='undefined')throw new Error('文字認識ライブラリを読み込めません。通信環境を確認してください。');
@@ -155,7 +173,7 @@
           const bitmap=await decodeCameraPhoto(file,8000);
           try {
             if(bitmap.width*bitmap.height>4000000)throw new Error('切り抜き画像を選んでください。全体写真はこの診断では扱いません。');
-            const reading=await recognizeCode(worker,bitmap,label);
+            const reading=await recognizeCode(worker,bitmap,label,{orientationHint:orientationHints[label]});
             results.push({label,file:file.name,width:bitmap.width,height:bitmap.height,...reading});
             el('diagnosticResult').textContent=results.map(item=>item.label+'：'+(item.code||item.candidates.join('・')||'未検出')+'（'+item.width+' × '+item.height+' px）').join('\n');
           }finally{if(typeof bitmap.close==='function')bitmap.close();}
@@ -166,7 +184,7 @@
       }catch(error){status('保存画像の診断エラー：'+error.message);}
       finally {
         if(worker){try{await worker.terminate();}catch(_){}}
-        const report=['パッケージ照合アプリ V9 保存画像診断','日時：'+new Date().toISOString(),'利用環境：'+(typeof navigator!=='undefined'?navigator.userAgent:'取得なし'),'認識データ再取得：'+refresh,el('diagnosticStatus').textContent,el('diagnosticResult').textContent,...results.map(item=>item.label+'：'+item.file+'\n'+item.rawText)].join('\n\n');
+        const report=['パッケージ照合アプリ V9.1 保存画像診断','日時：'+new Date().toISOString(),'利用環境：'+(typeof navigator!=='undefined'?navigator.userAgent:'取得なし'),'認識データ再取得：'+refresh,el('diagnosticStatus').textContent,el('diagnosticResult').textContent,...results.map(item=>item.label+'：'+item.file+'\n'+item.rawText)].join('\n\n');
         el('downloadDiagnostic').href='data:text/plain;charset=utf-8,'+encodeURIComponent('\uFEFF'+report);el('downloadDiagnostic').hidden=false;
         diagnosticBusy=false;busy=false;updateSaveControls();
       }
@@ -174,12 +192,13 @@
     function prepareRecognitionReport() {
       const pkg=selectedPackage();
       const report=[
-        'パッケージ照合アプリ V9 読み取り詳細',
+        'パッケージ照合アプリ V9.1 読み取り詳細',
         '保存日時：'+new Date().toISOString(),
         'パッケージ：'+(pkg?String(pkg.packageId)+' '+String(pkg.packageName):'未選択'),
         'マスク座標：'+(pkg?JSON.stringify({a:pkg.a,b:pkg.b}):'なし'),
         el('captureInfo').textContent,
         focusInfo,
+        '文字方向設定：'+JSON.stringify(getOrientationHints()),
         'A画像サイズ：'+el('imageSizeA').textContent,
         'B画像サイズ：'+el('imageSizeB').textContent,
         'Aコード：'+el('textAVal').textContent,
@@ -477,6 +496,7 @@
       record['rawText' + label] = reading.rawText;
     }
     function updateSaveControls() {
+      for(const id of ['orientationA','orientationB'])el(id).disabled=busy||saving||!!pendingRecord;
       for(const id of ['diagnosticBtn','diagnosticFileA','diagnosticFileB','diagnosticRefresh'])el(id).disabled=busy||saving||!!pendingRecord;
       el('saveRetryBtn').hidden = !pendingRecord || saving;
       el('retryBtn').disabled = busy || saving || !!pendingRecord;
@@ -908,6 +928,7 @@
       el('finalResult').className = className;
     }
     el('packageSelect').addEventListener('change', async () => {
+      loadOrientationSettings();
       el('resultArea').hidden = true;
       el('cameraCard').hidden = !selectedPackage();
       if (selectedPackage()) await startCamera();
@@ -916,6 +937,7 @@
     el('captureBtn').addEventListener('click', async () => {
       if (busy) return;
       busy = true;
+      updateSaveControls();
       el('captureBtn').disabled = true;
       el('captureBtn').textContent = '手持ち撮影中…';
       el('packageSelect').disabled = true;
@@ -969,7 +991,7 @@
         if (typeof Tesseract === 'undefined') throw new Error('文字認識ライブラリを読み込めません。通信環境を確認してください。');
         status('コード認識を準備しています。初回は読み込みに時間がかかります。');
         worker = await createCodeWorker();
-        const photoResults=await recognizePhotoSet(worker,recognitionShots);
+        const photoResults=await recognizePhotoSet(worker,recognitionShots,{orientationHints:getOrientationHints()});
         const readingA = photoResults.a;
         applyCodeReading(logContext, 'A', readingA);
         showCodeReading(readingA, 'A');
@@ -1007,6 +1029,7 @@
       }
     });
     el('diagnosticBtn').addEventListener('click', diagnoseSavedImages);
+    for(const label of ['A','B'])el('orientation'+label).addEventListener('change',saveOrientationSettings);
     el('retryBtn').addEventListener('click', async () => {
       if (busy || !selectedPackage()) return;
       el('resultArea').hidden = true;
