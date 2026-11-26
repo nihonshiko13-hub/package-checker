@@ -40,12 +40,12 @@
     </select>
     <label for="captureMode">撮影画質</label>
     <select id="captureMode"><option value="photo">高画質静止画を優先（対応端末）</option><option value="video">従来の連写</option></select>
-    <small>無料・手持ち撮影V7.3。手持ちの小さな揺れで撮影を中断しません。枠に文字を入れたまま、できるだけ同じ位置でお待ちください。対応端末では高画質写真を最大3枚撮り、A・Bの鮮明さを比較して選びます。進み具合は撮影ボタンの下に表示します。</small>
+    <small>無料・複数写真確認V8。手持ちで撮影できます。別々の写真でA・Bそれぞれのコードを2回以上確認して判定します。読み取りが食い違う場合や写真が不足する場合は「要確認」です。認識には従来より時間がかかる場合があります。進み具合は下に表示します。</small>
     <p id="status" role="status" aria-live="polite">マスターを読み込んでいます。</p>
   </div>
   <details class="card" id="savedImageDiagnostics">
     <summary>保存済みのA・B画像で認識を確認する（診断）</summary>
-    <p>撮影時と同じ認識処理で確認します。画像はスマホ内で処理し、この診断結果は判定履歴に記録しません。</p>
+    <p>A・B各1枚の読み取りを診断します。通常撮影の複数写真での一致確認とは別の診断です。画像はスマホ内で処理し、この診断結果は判定履歴に記録しません。</p>
     <label for="diagnosticFileA">Aの保存画像を選ぶ</label><input id="diagnosticFileA" type="file" accept="image/*">
     <label for="diagnosticFileB">Bの保存画像を選ぶ</label><input id="diagnosticFileB" type="file" accept="image/*">
     <label><input id="diagnosticRefresh" type="checkbox" checked> 認識データを再取得して確認する（通信が必要です）</label>
@@ -66,6 +66,7 @@
   </div>
   <div class="card" id="resultArea" hidden>
     <h2>判定結果</h2>
+    <p>下の画像は代表の1枚です。判定には別々に撮影した写真の認識結果を使います。</p>
     <p id="analysisStatus" role="status" aria-live="polite"></p>
     <p id="captureInfo"></p>
     <details id="photoDiagnostics" hidden><summary>撮影範囲を確認する</summary><p><a id="downloadCameraPhoto" download="camera-photo.jpg" hidden>カメラ写真（全体）を保存</a></p><p><a id="downloadReferenceFrame" download="preview-frame.png" hidden>比較用の映像（全体）を保存</a></p></details>
@@ -96,6 +97,40 @@
     let cameraPhotoUrl = null;
     let focusInfo = 'ピント：端末の自動設定';
     let diagnosticBusy = false;
+    let recognitionProgress = '';
+    function releaseRecognitionShots(shots=[]) {
+      for(const shot of shots)for(const key of ['a','b'])if(shot[key])shot[key].width=shot[key].height=1;
+    }
+    function combinePhotoReadings(items) {
+      const unique=Array.from(new Set(items.flatMap(item=>item.reading.candidates)));
+      const confirmed=items.filter(item=>item.reading.state==='read');
+      const support=new Map();for(const item of confirmed){const code=item.reading.code;if(!support.has(code))support.set(code,new Map());support.get(code).set(item.id,item.reading.confidence);}
+      const winner=unique.length===1?unique[0]:'';
+      const votes=winner?Array.from(support.get(winner)?.values()||[]):[];
+      const state=unique.length>1?'ambiguous':!unique.length?'missing':votes.length>=2?'read':'uncertain';
+      const confidence=state==='read'?Math.min(...votes):0;
+      const rawText=['複数写真の確認：独立した'+new Set(items.map(item=>item.id)).size+'枚を解析／'+(state==='read'?'2枚以上で一致を確認':'未確定'),'写真別の確定数：'+Array.from(support,([code,ids])=>code+'＝'+ids.size+'枚').join('・'),...items.map(item=>'['+item.id+'] '+item.reading.state+'／候補 '+item.reading.candidates.join('・')+'\n'+item.reading.rawText.slice(0,2600))].join('\n').slice(0,10000);
+      return {state,code:state==='read'?winner:'',candidates:unique,confidence,rawText};
+    }
+    async function recognizePhotoSet(worker,shots) {
+      const sides={A:[],B:[]},seen=new Set();
+      try {
+        for(let index=0;index<shots.length;index++) {
+          const shot=shots[index];if(seen.has(shot.id))continue;seen.add(shot.id);
+          for(const label of ['A','B']) {
+            recognitionProgress='写真'+(index+1)+'/'+shots.length+'・'+label+'：';
+            status('認識を確認しています。');
+            const reading=await recognizeCode(worker,shot[label.toLowerCase()],label,{budgetMs:12000});
+            sides[label].push({id:shot.id,reading});
+          }
+          const a=combinePhotoReadings(sides.A),b=combinePhotoReadings(sides.B);
+          showCodeReading(a,'A');showCodeReading(b,'B');
+          // 2枚で両側を確定できた場合は追加解析を省く。未確定・不一致候補は3枚目も確認する。
+          if(a.state==='read'&&b.state==='read')return {a,b};
+        }
+        return {a:combinePhotoReadings(sides.A),b:combinePhotoReadings(sides.B)};
+      }finally{recognitionProgress='';}
+    }
     async function createCodeWorker(refresh=false) {
       const worker=await Tesseract.createWorker('eng',1,refresh?{cacheMethod:'refresh'}:{},{load_system_dawg:'0',load_freq_dawg:'0',load_number_dawg:'0',load_punc_dawg:'0'});
       try{await worker.setParameters({tessedit_pageseg_mode:Tesseract.PSM.SPARSE_TEXT,user_defined_dpi:'300'});return worker;}
@@ -129,7 +164,7 @@
       }catch(error){status('保存画像の診断エラー：'+error.message);}
       finally {
         if(worker){try{await worker.terminate();}catch(_){}}
-        const report=['パッケージ照合アプリ V7.3 保存画像診断','日時：'+new Date().toISOString(),'利用環境：'+(typeof navigator!=='undefined'?navigator.userAgent:'取得なし'),'認識データ再取得：'+refresh,el('diagnosticStatus').textContent,el('diagnosticResult').textContent,...results.map(item=>item.label+'：'+item.file+'\n'+item.rawText)].join('\n\n');
+        const report=['パッケージ照合アプリ V8 保存画像診断','日時：'+new Date().toISOString(),'利用環境：'+(typeof navigator!=='undefined'?navigator.userAgent:'取得なし'),'認識データ再取得：'+refresh,el('diagnosticStatus').textContent,el('diagnosticResult').textContent,...results.map(item=>item.label+'：'+item.file+'\n'+item.rawText)].join('\n\n');
         el('downloadDiagnostic').href='data:text/plain;charset=utf-8,'+encodeURIComponent('\uFEFF'+report);el('downloadDiagnostic').hidden=false;
         diagnosticBusy=false;busy=false;updateSaveControls();
       }
@@ -137,7 +172,7 @@
     function prepareRecognitionReport() {
       const pkg=selectedPackage();
       const report=[
-        'パッケージ照合アプリ V7.3 読み取り詳細',
+        'パッケージ照合アプリ V8 読み取り詳細',
         '保存日時：'+new Date().toISOString(),
         'パッケージ：'+(pkg?String(pkg.packageId)+' '+String(pkg.packageName):'未選択'),
         'マスク座標：'+(pkg?JSON.stringify({a:pkg.a,b:pkg.b}):'なし'),
@@ -308,15 +343,20 @@
       context.drawImage(source,b.x0,b.y0-4,b.x1-b.x0,b.y1-b.y0+8,pad,pad-4,b.x1-b.x0,b.y1-b.y0+8);
       return canvas;
     }
-    async function recognizeCode(worker,source,label) {
+    async function recognizeCode(worker,source,label,options={}) {
       const passes=[],orientations=[];
+      const deadline=Date.now()+(options.budgetMs??Infinity);
+      const expired=()=>Date.now()>deadline;
+      const timedOut=()=>{const reading=summarizeCodePasses(passes);if(reading.state==='read'){reading.state='uncertain';reading.code='';reading.confidence=0;}reading.rawText='解析時間の上限に達したため、この写真の認識は未確定です。\n'+reading.rawText;return reading;};
+      const readImage=image=>Number.isFinite(deadline)?cameraOperation(worker.recognize(image),8000):worker.recognize(image);
       await worker.setParameters({tessedit_pageseg_mode:Tesseract.PSM.SPARSE_TEXT,tessedit_char_whitelist:''});
       for(const base of [0,90,180,270]) {
         let bestScore=0;
         for(const offset of [0,-4,4]) {
+          if(expired())return timedOut();
           const angle=(base+offset+360)%360;
           status(label+'のコードを解析中（'+angle+'度・傾き補正）。');
-          const {data}=await worker.recognize(makeRecognitionImage(source,angle));
+          const {data}=await readImage(makeRecognitionImage(source,angle));
           passes.push({angle,region:'傾き補正・グレー',text:data.text||'',candidates:candidatesFromOcr(data)});
           bestScore=Math.max(bestScore,orientationScore(data));
         }
@@ -333,9 +373,10 @@
           const binary=mode==='binary',image=makeRecognitionImage(source,angle,binary);
           const tops=binary?[.35,.175,.525,0,.7]:[.3,.4,.2,.5,.1,.6,0,.7,.8];
           for(const left of [.25,0])for(const top of tops) {
+            if(expired())return timedOut();
             status(label+'を自動切り分けして再解析中（'+(++attempts)+'/336）。');
             const tile=makeRecognitionTile(image,left,top,binary?.3:.18);
-            const {data}=await worker.recognize(tile);
+            const {data}=await readImage(tile);
             const detected=candidatesFromOcr(data);
             passes.push({angle,region:'自動切り分け・'+(binary?'白黒':'グレー')+' '+left+','+top,text:data.text||'',candidates:detected.filter(candidate=>completeTileCandidate(candidate,tile)),rejected:detected.filter(candidate=>!completeTileCandidate(candidate,tile))});
             if(!binary&&rereads<24)for(const word of codeWordRegions(data,tile)) {
@@ -346,7 +387,7 @@
                 // 行分割で上下が切れた場合も、元の回転画像から余白を含めて取り直す。
                 const b=word.bbox,extra=4;
                 const bounds={x0:b.x0-20+image.width*left,x1:b.x1-20+image.width*left,y0:Math.max(0,b.y0-20+image.height*top-extra),y1:Math.min(image.height,b.y1-20+image.height*top+extra)};
-                reread=await worker.recognize(makeWordImage(image,bounds));
+                reread=await readImage(makeWordImage(image,bounds));
               }
               finally{await worker.setParameters({tessedit_pageseg_mode:Tesseract.PSM.SINGLE_LINE});}
               passes.push({angle,region:'文字候補再認識 '+word.text,text:reread.data.text||'',candidates:candidatesFromOcr(reread.data)});
@@ -419,6 +460,7 @@
       if (pendingRecord) { event.preventDefault(); event.returnValue = ''; }
     });
     function status(message) {
+      message=recognitionProgress+message;
       if(diagnosticBusy){el('diagnosticStatus').textContent=message;return;}
       el('status').textContent = message;
       if(el('cameraStatus'))el('cameraStatus').textContent=message;
@@ -584,6 +626,28 @@
       }
       return best;
     }
+    function makeRecognitionShot(source,pkg,id) {
+      let a;
+      try{a=cropToCanvasBase64(source,pkg.a,'A');return {id,a,b:cropToCanvasBase64(source,pkg.b,'B')};}
+      catch(error){if(a)a.width=a.height=1;throw error;}
+    }
+    async function captureVideoShots(pkg,generation) {
+      const shots=[],seen=new Set();
+      try {
+        for(let index=0;index<3;index++) {
+          assertLiveCamera(generation);
+          const time=Number(video.currentTime),key=Number.isFinite(time)?String(time):'unknown';
+          if(!seen.has(key)) {
+            seen.add(key);
+            const frame=document.createElement('canvas');frame.width=video.videoWidth;frame.height=video.videoHeight;
+            try{frame.getContext('2d').drawImage(video,0,0);shots.push(makeRecognitionShot(frame,pkg,'動画'+key));}
+            finally{frame.width=frame.height=1;}
+          }
+          if(index<2)await new Promise(resolve=>setTimeout(resolve,180));
+        }
+        return shots;
+      }catch(error){releaseRecognitionShots(shots);throw error;}
+    }
     function centerPhotoGeometry(width,height,angle,aspect) {
       const sideways=angle===90||angle===270;
       const rotatedWidth=sideways?height:width,rotatedHeight=sideways?width:height;
@@ -701,6 +765,8 @@
       const generation=cameraGeneration;
       const initialMotion=await waitForCameraStability(pkg,generation);
       const reference=await captureBestFrame(pkg);
+      try{reference.recognitionShots=await captureVideoShots(pkg,generation);}
+      catch(error){reference.width=reference.height=1;throw error;}
       reference.captureInfo='従来の連写：'+reference.width+' × '+reference.height+' px';
       reference.captureInfo+='／手持ち撮影（揺れで中断しません）';
       if(initialMotion&&!initialMotion.stable)reference.captureInfo+='／撮影前に揺れを検出';
@@ -711,6 +777,7 @@
       let best=null,bestScore=-1,bestBlob=null,bestIndex=0,shots=0,accepted=0;
       const captureDeadline=Date.now()+22000;
       const reasons=[];
+      const nativeShots=[];
       try{
         status('高画質静止画を準備しています。枠に文字を入れたままお待ちください。');
         const track=mediaStream&&mediaStream.getVideoTracks()[0];
@@ -744,6 +811,8 @@
             let score;
             try{score=combinedSharpness(regionSharpness(canvas,pkg.a),regionSharpness(canvas,pkg.b));}
             catch(error){canvas.width=canvas.height=1;throw error;}
+            try{nativeShots.push({...makeRecognitionShot(canvas,pkg,'静止画'+(index+1)),score});}
+            catch(error){canvas.width=canvas.height=1;throw error;}
             accepted++;
             reasons.push('写真'+(index+1)+'：鮮明さ指標 '+score.toFixed(1));
             if(score>bestScore){if(best)best.width=best.height=1;best=canvas;bestScore=score;bestBlob=blob;bestIndex=index+1;}
@@ -757,13 +826,16 @@
         }
         if(best){
           setPhotoDiagnostics(bestBlob,reference);
-          best.captureInfo='高画質静止画：'+best.width+' × '+best.height+' px／手持ち撮影／'+shots+'枚撮影・'+accepted+'枚比較・写真'+bestIndex+'を採用\n'+focusInfo+'\n'+reasons.join('\n');
+          best.recognitionShots=nativeShots.sort((a,b)=>b.score-a.score);
+          releaseRecognitionShots(reference.recognitionShots);
+          best.captureInfo='高画質静止画：'+best.width+' × '+best.height+' px／手持ち撮影／'+shots+'枚撮影・'+accepted+'枚を認識確認に使用／表示は写真'+bestIndex+'\n'+focusInfo+'\n'+reasons.join('\n');
           reference.width=reference.height=1;return best;
         }
         reference.captureInfo+='（高画質写真を採用できなかったため）\n'+focusInfo+'\n'+reasons.join('\n');return reference;
       }catch(error){
+        releaseRecognitionShots(nativeShots);
         if(best)best.width=best.height=1;
-        if(generation!==cameraGeneration){reference.width=reference.height=1;throw error;}
+        if(generation!==cameraGeneration){releaseRecognitionShots(reference.recognitionShots);reference.width=reference.height=1;throw error;}
         console.warn('高画質撮影を利用できませんでした',error);
         reference.captureInfo+='（この端末では高画質撮影を利用できなかったため）';return reference;
       }
@@ -801,6 +873,8 @@
       setResult('未判定');
       let logContext = null;
       let worker = null;
+      let recognitionShots=[];
+      let capturedFrame=null;
       try {
         const pkg = selectedPackage();
         if (!pkg) throw new Error('パッケージが選択されていません。');
@@ -808,8 +882,9 @@
         if (video.readyState < 2 || video.videoWidth < 1 || video.videoHeight < 1) {
           throw new Error('映像の準備ができていません。もう一度撮影してください。');
         }
-        // 同じフレームに写るA・Bを評価し、連写の中から1枚を選ぶ。
-        const frame = await captureInspectionFrame(pkg);
+        // 各写真のA・Bを同じフレームから切り出し、別々の写真間で照合する。
+        const frame = capturedFrame = await captureInspectionFrame(pkg);
+        recognitionShots=frame.recognitionShots?.length?frame.recognitionShots:[makeRecognitionShot(frame,pkg,'写真1')];
         el('captureInfo').textContent=frame.captureInfo;
         const imageA = cropToCanvasBase64(frame, pkg.a, 'A');
         const imageB = cropToCanvasBase64(frame, pkg.b, 'B');
@@ -821,6 +896,8 @@
           el('download'+label).href = el('preview'+label).src;
           el('download'+label).hidden = false;
         }
+        frame.width=frame.height=1;
+        imageA.width=imageA.height=imageB.width=imageB.height=1;
         // フレーム保存・切り抜き後にカメラを停止する。
         el('captureBtn').textContent='撮影完了・文字認識中';
         stopCamera();
@@ -829,15 +906,16 @@
         if (typeof Tesseract === 'undefined') throw new Error('文字認識ライブラリを読み込めません。通信環境を確認してください。');
         status('コード認識を準備しています。初回は読み込みに時間がかかります。');
         worker = await createCodeWorker();
-        const readingA = await recognizeCode(worker, imageA, 'A');
+        const photoResults=await recognizePhotoSet(worker,recognitionShots);
+        const readingA = photoResults.a;
         applyCodeReading(logContext, 'A', readingA);
         showCodeReading(readingA, 'A');
-        const readingB = await recognizeCode(worker, imageB, 'B');
+        const readingB = photoResults.b;
         applyCodeReading(logContext, 'B', readingB);
         showCodeReading(readingB, 'B');
         const verdict = judgeCodeResults(readingA, readingB);
         setResult(verdict, verdict === 'OK' ? 'ok' : verdict === 'NG' ? 'ng' : 'pending');
-        const messages = { OK: 'A・Bのコードが一致しました。', NG: 'A・Bのコードが異なります。', '要確認': '候補が複数あるか、読み取りが不鮮明です。表示された候補と画像を確認して再撮影してください。', '読取不可': '英字2文字＋数字2桁のコードを検出できませんでした。ピントと写っている範囲を確認してください。' };
+        const messages = { OK: 'A・Bそれぞれを別の写真で2回以上確認し、コードが一致しました。', NG: 'A・Bそれぞれを別の写真で2回以上確認しましたが、コードが異なります。', '要確認': '写真間で候補が食い違うか、同じコードを2枚以上で確認できませんでした。画像と詳細を確認してください。', '読取不可': 'コードを検出できませんでした。ピントと写っている範囲を確認してください。' };
         status(messages[verdict]);
         pendingRecord = logContext;
         await savePendingRecord();
@@ -853,6 +931,8 @@
           el('saveStatus').textContent = '履歴：撮影前に中断したため保存していません。';
         }
       } finally {
+        releaseRecognitionShots(recognitionShots);recognitionProgress='';
+        if(capturedFrame)capturedFrame.width=capturedFrame.height=1;
         if (worker) { try { await worker.terminate(); } catch (_) {} }
         busy = false;
         el('packageSelect').disabled = false;
