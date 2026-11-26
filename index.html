@@ -45,7 +45,7 @@
     <label for="orientationB">B文字を正立させる回転</label>
     <select id="orientationB"><option value="auto">自動</option><option value="0">回転なし（正立）</option><option value="90">右90°</option><option value="180">180°（上下逆）</option><option value="270">左90°</option></select>
     <small>コードの登録は不要です。文字の向きが決まっている場合は指定すると、別の向きの誤候補を避けて解析できます。設定はパッケージ別にこの端末へ保存します。</small>
-    <small>無料・向き指定認識V9.1。手持ちで撮影できます。別々の写真でA・Bそれぞれのコードを2回以上確認して判定します。読み取りが食い違う場合や写真が不足する場合は「要確認」です。認識には従来より時間がかかる場合があります。進み具合は下に表示します。</small>
+    <small>無料・速度対策V9.2。手持ちで撮影できます。別々の写真でA・Bそれぞれのコードを2回以上確認して判定します。読み取りが食い違う場合や写真が不足する場合は「要確認」です。認識には従来より時間がかかる場合があります。進み具合は下に表示します。</small>
     <p id="status" role="status" aria-live="polite">マスターを読み込んでいます。</p>
   </div>
   <details class="card" id="savedImageDiagnostics">
@@ -103,6 +103,24 @@
     let focusInfo = 'ピント：端末の自動設定';
     let diagnosticBusy = false;
     let recognitionProgress = '';
+    let cachedCodeWorker=null,workerIdleTimer=null,workerCacheAllowed=true;
+    async function clearCodeWorkerCache() {
+      if(workerIdleTimer)clearTimeout(workerIdleTimer);workerIdleTimer=null;
+      const worker=cachedCodeWorker;cachedCodeWorker=null;
+      if(worker){try{await worker.terminate();}catch(_){}}
+    }
+    async function acquireCodeWorker(refresh=false) {
+      if(workerIdleTimer)clearTimeout(workerIdleTimer);workerIdleTimer=null;
+      if(refresh)await clearCodeWorkerCache();
+      if(cachedCodeWorker){const worker=cachedCodeWorker;cachedCodeWorker=null;return worker;}
+      return createCodeWorker(refresh);
+    }
+    async function recycleCodeWorker(worker,healthy) {
+      if(!worker)return;
+      if(!healthy||!workerCacheAllowed){try{await worker.terminate();}catch(_){}return;}
+      await clearCodeWorkerCache();cachedCodeWorker=worker;
+      workerIdleTimer=setTimeout(()=>{void clearCodeWorkerCache();},120000);
+    }
     function getOrientationHints() {
       const result={};for(const label of ['A','B']){const value=el('orientation'+label).value;if(['0','90','180','270'].includes(value))result[label]=Number(value);}return result;
     }
@@ -135,6 +153,7 @@
         for(let index=0;index<shots.length;index++) {
           const shot=shots[index];if(seen.has(shot.id))continue;seen.add(shot.id);
           for(const label of ['A','B']) {
+            if(combinePhotoReadings(sides[label]).state==='read')continue;
             recognitionProgress='写真'+(index+1)+'/'+shots.length+'・'+label+'：';
             status('認識を確認しています。');
             const reading=await recognizeCode(worker,shot[label.toLowerCase()],label,{budgetMs:12000,orientationHint:hints[label]});
@@ -162,13 +181,14 @@
       busy=true;diagnosticBusy=true;updateSaveControls();
       el('diagnosticResult').textContent='';el('downloadDiagnostic').hidden=true;
       let worker;
+      let workerHealthy=false;
       const results=[];
       const refresh=el('diagnosticRefresh').checked;
       const orientationHints=getOrientationHints();
       try {
         status('保存画像の診断を準備中。初回・再取得時は認識データを読み込みます。');
         if(typeof Tesseract==='undefined')throw new Error('文字認識ライブラリを読み込めません。通信環境を確認してください。');
-        worker=await createCodeWorker(refresh);
+        worker=await acquireCodeWorker(refresh);
         for(const [label,file] of [['A',a],['B',b]]) {
           const bitmap=await decodeCameraPhoto(file,8000);
           try {
@@ -179,12 +199,13 @@
           }finally{if(typeof bitmap.close==='function')bitmap.close();}
         }
         const verdict=judgeCodeResults(results[0],results[1]);
+        workerHealthy=true;
         el('diagnosticResult').textContent+='\n診断判定：'+verdict;
         status('保存画像の診断が完了しました。この診断は履歴に保存していません。');
       }catch(error){status('保存画像の診断エラー：'+error.message);}
       finally {
-        if(worker){try{await worker.terminate();}catch(_){}}
-        const report=['パッケージ照合アプリ V9.1 保存画像診断','日時：'+new Date().toISOString(),'利用環境：'+(typeof navigator!=='undefined'?navigator.userAgent:'取得なし'),'認識データ再取得：'+refresh,el('diagnosticStatus').textContent,el('diagnosticResult').textContent,...results.map(item=>item.label+'：'+item.file+'\n'+item.rawText)].join('\n\n');
+        await recycleCodeWorker(worker,workerHealthy);
+        const report=['パッケージ照合アプリ V9.2 保存画像診断','日時：'+new Date().toISOString(),'利用環境：'+(typeof navigator!=='undefined'?navigator.userAgent:'取得なし'),'認識データ再取得：'+refresh,el('diagnosticStatus').textContent,el('diagnosticResult').textContent,...results.map(item=>item.label+'：'+item.file+'\n'+item.rawText)].join('\n\n');
         el('downloadDiagnostic').href='data:text/plain;charset=utf-8,'+encodeURIComponent('\uFEFF'+report);el('downloadDiagnostic').hidden=false;
         diagnosticBusy=false;busy=false;updateSaveControls();
       }
@@ -192,7 +213,7 @@
     function prepareRecognitionReport() {
       const pkg=selectedPackage();
       const report=[
-        'パッケージ照合アプリ V9.1 読み取り詳細',
+        'パッケージ照合アプリ V9.2 読み取り詳細',
         '保存日時：'+new Date().toISOString(),
         'パッケージ：'+(pkg?String(pkg.packageId)+' '+String(pkg.packageName):'未選択'),
         'マスク座標：'+(pkg?JSON.stringify({a:pkg.a,b:pkg.b}):'なし'),
@@ -691,23 +712,32 @@
     async function captureBestFrame(pkg) {
       const a=validateArea(pkg.a,'A'),b=validateArea(pkg.b,'B');
       const generation=cameraGeneration;
-      let best=null,bestScore=-1;
+      let best=null,bestScore=-1,currentFrame=null;
+      const pairs=[],seen=new Set();
+      try {
       // ボタンを触った瞬間の揺れが収まる時間を取る。
       await new Promise(resolve=>setTimeout(resolve,200));
       for(let index=0;index<5;index++) {
         if(generation!==cameraGeneration || !mediaStream || video.readyState<2 || !video.videoWidth || !video.videoHeight) throw new Error('撮影中に映像が停止しました。もう一度撮影してください。');
         status('手持ち連写中（'+(index+1)+'/5）。枠に文字を入れたままお待ちください。');
         const frame=document.createElement('canvas');
+        currentFrame=frame;
         frame.width=video.videoWidth;frame.height=video.videoHeight;
         frame.getContext('2d').drawImage(video,0,0);
         const score=combinedSharpness(regionSharpness(frame,a),regionSharpness(frame,b));
+        const time=Number(video.currentTime),key=Number.isFinite(time)?String(time):'unknown';
+        if(!seen.has(key)){seen.add(key);pairs.push({...makeRecognitionShot(frame,pkg,'動画'+key),score});}
         if(score>bestScore) {
           if(best){best.width=1;best.height=1;}
           best=frame;bestScore=score;
         }else{frame.width=1;frame.height=1;}
+        currentFrame=null;
         if(index<4)await new Promise(resolve=>setTimeout(resolve,160));
       }
-      return best;
+      const selected=pairs.slice().sort((a,b)=>b.score-a.score).slice(0,3);
+      releaseRecognitionShots(pairs.filter(pair=>!selected.includes(pair)));
+      best.recognitionShots=selected;return best;
+      }catch(error){releaseRecognitionShots(pairs);if(currentFrame)currentFrame.width=currentFrame.height=1;if(best)best.width=best.height=1;throw error;}
     }
     function makeRecognitionShot(source,pkg,id) {
       let a;
@@ -848,7 +878,7 @@
       const generation=cameraGeneration;
       const initialMotion=await waitForCameraStability(pkg,generation);
       const reference=await captureBestFrame(pkg);
-      try{reference.recognitionShots=await captureVideoShots(pkg,generation);}
+      try{if(!reference.recognitionShots?.length)reference.recognitionShots=await captureVideoShots(pkg,generation);}
       catch(error){reference.width=reference.height=1;throw error;}
       reference.captureInfo='従来の連写：'+reference.width+' × '+reference.height+' px';
       reference.captureInfo+='／手持ち撮影（揺れで中断しません）';
@@ -958,6 +988,7 @@
       setResult('未判定');
       let logContext = null;
       let worker = null;
+      let workerHealthy=false;
       let recognitionShots=[];
       let capturedFrame=null;
       try {
@@ -968,9 +999,10 @@
           throw new Error('映像の準備ができていません。もう一度撮影してください。');
         }
         // 各写真のA・Bを同じフレームから切り出し、別々の写真間で照合する。
+        const captureStarted=Date.now();
         const frame = capturedFrame = await captureInspectionFrame(pkg);
         recognitionShots=frame.recognitionShots?.length?frame.recognitionShots:[makeRecognitionShot(frame,pkg,'写真1')];
-        el('captureInfo').textContent=frame.captureInfo;
+        el('captureInfo').textContent=frame.captureInfo+'\n撮影処理：'+((Date.now()-captureStarted)/1000).toFixed(1)+'秒';
         const imageA = cropToCanvasBase64(frame, pkg.a, 'A');
         const imageB = cropToCanvasBase64(frame, pkg.b, 'B');
         logContext = { action: 'saveResult', recognitionMode: 'code-2letters-2digits-v1', saveId: crypto.randomUUID(), packageId: String(pkg.packageId), textA: '', textB: '', candidatesA: [], candidatesB: [], confidenceA: 0, confidenceB: 0, rawTextA: '', rawTextB: '', errorMessage: '' };
@@ -990,8 +1022,11 @@
         el('resultArea').hidden = false;
         if (typeof Tesseract === 'undefined') throw new Error('文字認識ライブラリを読み込めません。通信環境を確認してください。');
         status('コード認識を準備しています。初回は読み込みに時間がかかります。');
-        worker = await createCodeWorker();
+        const recognitionStarted=Date.now();
+        worker = await acquireCodeWorker();
         const photoResults=await recognizePhotoSet(worker,recognitionShots,{orientationHints:getOrientationHints()});
+        workerHealthy=true;
+        el('captureInfo').textContent+='\n認識・照合：'+((Date.now()-recognitionStarted)/1000).toFixed(1)+'秒';
         const readingA = photoResults.a;
         applyCodeReading(logContext, 'A', readingA);
         showCodeReading(readingA, 'A');
@@ -1018,7 +1053,7 @@
       } finally {
         releaseRecognitionShots(recognitionShots);recognitionProgress='';
         if(capturedFrame)capturedFrame.width=capturedFrame.height=1;
-        if (worker) { try { await worker.terminate(); } catch (_) {} }
+        await recycleCodeWorker(worker,workerHealthy);
         busy = false;
         el('packageSelect').disabled = false;
         el('languageSelect').disabled = false;
@@ -1037,6 +1072,8 @@
       await startCamera();
     });
     window.addEventListener('pagehide', stopCamera);
+    window.addEventListener('pagehide',()=>{workerCacheAllowed=false;void clearCodeWorkerCache();});
+    window.addEventListener('pageshow',()=>{workerCacheAllowed=true;});
     (async () => {
       try {
         const response = await fetch(GAS_API_URL);
