@@ -45,7 +45,7 @@
     <label for="orientationB">B文字を正立させる回転</label>
     <select id="orientationB"><option value="auto">自動</option><option value="0">回転なし（正立）</option><option value="90">右90°</option><option value="180">180°（上下逆）</option><option value="270">左90°</option></select>
     <small>コードの登録は不要です。文字の向きが決まっている場合は指定すると、別の向きの誤候補を避けて解析できます。設定はパッケージ別にこの端末へ保存します。</small>
-    <small>無料・速度対策V9.2。手持ちで撮影できます。別々の写真でA・Bそれぞれのコードを2回以上確認して判定します。読み取りが食い違う場合や写真が不足する場合は「要確認」です。認識には従来より時間がかかる場合があります。進み具合は下に表示します。</small>
+    <small>無料・処理準備対策V9.3。固定式でA・Bを同時撮影できます。撮影画質・枚数・判定条件はV9.2と同じです。別々の写真でA・Bそれぞれのコードを2回以上確認して判定します。読み取りが食い違う場合や写真が不足する場合は「要確認」です。進み具合は下に表示します。</small>
     <p id="status" role="status" aria-live="polite">マスターを読み込んでいます。</p>
   </div>
   <details class="card" id="savedImageDiagnostics">
@@ -100,16 +100,28 @@
     let pendingRecord = null;
     let saving = false;
     let cameraPhotoUrl = null;
+    let diagnosticReference = null;
     let focusInfo = 'ピント：端末の自動設定';
     let diagnosticBusy = false;
     let recognitionProgress = '';
     let cachedCodeWorker=null,workerIdleTimer=null,workerCacheAllowed=true;
+    let preparingCodeWorker=null;
+    function prepareCodeWorker() {
+      if(busy||diagnosticBusy||cachedCodeWorker||preparingCodeWorker||!workerCacheAllowed||typeof Tesseract==='undefined')return;
+      // カメラの準備後、画像を認識せずに認識エンジンだけを先に読み込む。
+      preparingCodeWorker=Promise.resolve().then(()=>createCodeWorker()).then(async worker=>{
+        await recycleCodeWorker(worker,true);
+      }).catch(()=>{
+        // 先行準備の失敗では撮影を止めない。判定時に通常の初期化を再試行する。
+      }).finally(()=>{preparingCodeWorker=null;});
+    }
     async function clearCodeWorkerCache() {
       if(workerIdleTimer)clearTimeout(workerIdleTimer);workerIdleTimer=null;
       const worker=cachedCodeWorker;cachedCodeWorker=null;
       if(worker){try{await worker.terminate();}catch(_){}}
     }
     async function acquireCodeWorker(refresh=false) {
+      if(preparingCodeWorker)await preparingCodeWorker;
       if(workerIdleTimer)clearTimeout(workerIdleTimer);workerIdleTimer=null;
       if(refresh)await clearCodeWorkerCache();
       if(cachedCodeWorker){const worker=cachedCodeWorker;cachedCodeWorker=null;return worker;}
@@ -205,7 +217,7 @@
       }catch(error){status('保存画像の診断エラー：'+error.message);}
       finally {
         await recycleCodeWorker(worker,workerHealthy);
-        const report=['パッケージ照合アプリ V9.2 保存画像診断','日時：'+new Date().toISOString(),'利用環境：'+(typeof navigator!=='undefined'?navigator.userAgent:'取得なし'),'認識データ再取得：'+refresh,el('diagnosticStatus').textContent,el('diagnosticResult').textContent,...results.map(item=>item.label+'：'+item.file+'\n'+item.rawText)].join('\n\n');
+        const report=['パッケージ照合アプリ V9.3 保存画像診断','日時：'+new Date().toISOString(),'利用環境：'+(typeof navigator!=='undefined'?navigator.userAgent:'取得なし'),'認識データ再取得：'+refresh,el('diagnosticStatus').textContent,el('diagnosticResult').textContent,...results.map(item=>item.label+'：'+item.file+'\n'+item.rawText)].join('\n\n');
         el('downloadDiagnostic').href='data:text/plain;charset=utf-8,'+encodeURIComponent('\uFEFF'+report);el('downloadDiagnostic').hidden=false;
         diagnosticBusy=false;busy=false;updateSaveControls();
       }
@@ -213,7 +225,7 @@
     function prepareRecognitionReport() {
       const pkg=selectedPackage();
       const report=[
-        'パッケージ照合アプリ V9.2 読み取り詳細',
+        'パッケージ照合アプリ V9.3 読み取り詳細',
         '保存日時：'+new Date().toISOString(),
         'パッケージ：'+(pkg?String(pkg.packageId)+' '+String(pkg.packageName):'未選択'),
         'マスク座標：'+(pkg?JSON.stringify({a:pkg.a,b:pkg.b}):'なし'),
@@ -233,16 +245,17 @@
     }
     function clearPhotoDiagnostics() {
       if(cameraPhotoUrl&&typeof URL!=='undefined')URL.revokeObjectURL(cameraPhotoUrl);
-      cameraPhotoUrl=null;
+      cameraPhotoUrl=null;diagnosticReference=null;
       el('photoDiagnostics').hidden=true;
       for(const id of ['downloadCameraPhoto','downloadReferenceFrame']){el(id).hidden=true;el(id).removeAttribute('href');}
     }
     function setPhotoDiagnostics(blob,reference) {
       if(typeof URL!=='undefined'&&typeof URL.createObjectURL==='function') {
+        if(cameraPhotoUrl)URL.revokeObjectURL(cameraPhotoUrl);
         cameraPhotoUrl=URL.createObjectURL(blob);el('downloadCameraPhoto').href=cameraPhotoUrl;
         el('downloadCameraPhoto').download=blob.type==='image/png'?'camera-photo.png':'camera-photo.jpg';el('downloadCameraPhoto').hidden=false;
       }
-      if(typeof reference.toDataURL==='function') {el('downloadReferenceFrame').href=reference.toDataURL('image/png');el('downloadReferenceFrame').hidden=false;}
+      if(diagnosticReference!==reference&&typeof reference.toDataURL==='function') {el('downloadReferenceFrame').href=reference.toDataURL('image/png');el('downloadReferenceFrame').hidden=false;diagnosticReference=reference;}
       el('photoDiagnostics').hidden=false;
     }
     const MIN_CODE_CONFIDENCE = 60;
@@ -619,6 +632,7 @@
         focusInfo=configuredFocus;
         el('captureBtn').disabled = false;
         status('赤枠に文字を合わせ、ピントが合ってから撮影してください。');
+        prepareCodeWorker();
       } catch (error) {
         if (generation !== cameraGeneration) return;
         stopCamera();
